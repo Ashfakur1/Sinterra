@@ -5,120 +5,23 @@ Physics-informed synthetic dataset generation for ceramic tile composition
 optimisation from 48 laboratory-fabricated calibration batches.
 
 CHANGE LOG (48 batches)
-  This version fixes two methodological issues surfaced by honest nested
-  LOO-CV diagnostics on the 48-batch set:
-
   1. REMOVED magnitude-floor forcing on Ridge coefficients.
-     The previous version replaced any Ridge coefficient falling below a
-     hand-set floor with the floor value. At n=48 this
-     floor was empirically shown to be actively harmful: for Shrinkage_pct
-     specifically, removing the floor (keeping only the physically-motivated
-     SIGN correction) cut LOO-CV relative error from ~54% to ~29%, with no
-     degradation to MOR or WA. Sign correction is retained -- it encodes
-     established sintering physics (Reed 1995) and never contradicts the
-     data's own fitted direction unless Ridge itself is noise-dominated.
+  2. Ridge alpha selected PER TARGET via nested Leave-One-Out CV.
+  3. validate_physics() reports SKILL SCORE relative to mean-only baseline.
 
-  2. Ridge alpha is now selected PER TARGET via nested Leave-One-Out
-     cross-validation (inner LOO on the 40 training batches only, for each
-     outer held-out batch), instead of a single fixed alpha=0.1 justified
-     by an n=p=8 near-determined system that no longer holds at n=48.
-     The alpha grid is capped at 10.0. This cap is a deliberate choice,
-     not an oversight: diagnostics showed that as alpha increases without
-     bound, LOO-CV error for every target monotonically converges to the
-     error of a trivial "predict the training mean, ignore composition"
-     baseline. An unbounded alpha search would therefore "pass" any
-     MAE-based threshold by simply giving up on learning a composition-
-     property relationship. Capping the grid keeps the fit in a regime
-     where it is still doing something other than reproducing the mean.
-
-  3. validate_physics() now reports a SKILL SCORE relative to the
-     mean-only baseline for every target, alongside the existing
-     MAE/range percentage. A model that does not beat the baseline is
-     flagged explicitly rather than allowed to read as a silent PASS.
-     This directly addresses the reviewer concern that reported
-     performance may not reflect a genuinely learned experimental
-     relationship.
-
-RECALIBRATION NOTE
-  Recalibrated against a new 48-batch lab_batches_raw.csv.
-  No logic changes were needed for the linear (Ridge) term: it
-  is refit at import time directly from whatever CSV is on disk. The
-  interaction and AG98-quadratic terms remain fixed constants carried
-  over from the previous calibration (see limitation note in Step 3 of
-  COEFFICIENT ESTIMATION below) -- they were NOT refit against this new
-  data. Check the validate_physics() skill-score output after loading
-  this dataset before relying on them; if skill degrades relative to
-  the previous calibration, those two terms are the first place to look.
+ROBUSTNESS PATCH (N_SYNTHETIC == 0)
+  All plotting and summary functions now degrade gracefully when the
+  synthetic set is empty: they fall back to the experimental (lab_batch)
+  rows, disable KDE when there are too few points, and never abort the
+  figure-generation stage. This lets N_SYNTHETIC = 0 produce the full
+  figure set from the lab batches alone.
 
 MATHEMATICAL MODEL
   Y = Ȳ_lab + Σ_m β_m·(x_m − x̄_m)
-            + γ·(ΣClay − ΣClay_mean)·(ΣFsp − ΣFsp_mean)   [interaction]
-            + δ·(x_AG98 − x̄_AG98)²                         [quadratic]
+            + γ·(ΣClay − ΣClay_mean)·(ΣFsp − ΣFsp_mean)
+            + δ·(x_AG98 − x̄_AG98)²
             + ε(d)
-  ε(d) ~ N(0, σ_base·(1 + d/d_ref))   [heteroscedastic]
-
-COEFFICIENT ESTIMATION
-  Step 1 — Ridge regression on the 48 lab batches, alpha selected per
-            target via nested LOO-CV (see change log above).
-            Ref: Hoerl & Kennard (1970) DOI:10.1080/00401706.1970.10488634
-  Step 2 — Physics-based SIGN correction only (no magnitude floor) is
-            applied to Ridge estimates: if a coefficient's sign
-            contradicts the expected sintering-physics direction, its
-            sign is flipped and its magnitude preserved. No hand-set
-            minimum magnitude is imposed.
-            Ref: Reed (1995) Principles of Ceramics Processing, Ch.12.
-  Step 3 — A Clay–Feldspar interaction term and an AG98 quadratic term
-            (fixed constants, calibrated on the PREVIOUS batch set) capture
-            non-linear sintering behaviour. NOTE: these remain fixed
-            constants rather than fitted regressors -- flagged here as a
-            known limitation for future work, since honest testing of
-            their marginal contribution under nested CV has not yet been
-            done on this dataset.
-            Ref: Carty & Senapati (1998) DOI:10.1111/j.1151-2916.1998.tb02439.x
-
-MATERIAL ROLES — clay-dominant floor tile body, 1210 °C, 100 bar
-  AG98      High Plastic Clay   → MOR↑  WA↓  Shrink↑
-  AG22      Low Plastic Clay    → MOR↑  WA↓  Shrink↑  (weaker signal)
-  AG23      Semi-Plastic Clay   → MOR↑  WA↓  Shrink↑
-  SodaF     Soda Feldspar       → MOR↓  WA↑  Shrink↓  (clay diluent)
-  PotashF   Potash Feldspar     → MOR↓  WA↑  Shrink↓  (stronger diluent)
-  Crushing  Pre-fired filler    → MOR↑  WA↓  Shrink↓
-  ETP       ETP sludge (alkali) → MOR↑  WA↓  Shrink↑  (liquid-phase sinter)
-  NaSil     Sodium Silicate     → rheology modifier; small effect on WA
-
-CO₂ FACTORS  (kg CO₂ / kg, cradle-to-gate)
-  AG98 (High Plastic Clay)  0.129       Zeng et al. 2025 DOI:10.4236/eng.2025.1712035
-  AG22 (Low Plastic Clay)   0.129       Proxy: same as AG98 (AP-42 §11.25 scope mismatch)
-  AG23 (Semi Plastic Clay)  0.129       Proxy: same as AG98 (AP-42 §11.25 scope mismatch)
-  Soda Feldspar (SodaF)     0.053       LB Minerals EPD, Pobežovice site
-  Potash Feldspar (PotashF) 0.0286      LB Minerals EPD, Nová Ves site
-  Crushing                  0.587       LB Minerals Chamotte EPD
-  ETP sludge                0.242       Li et al. 2023, Incineration pathway
-  NaSil                     0.433       EPD-IES-0021224, Prochin Italia
-
-VALIDATION
-  Leave-One-Out cross-validation on the 48 laboratory batches. For each
-  held-out batch, Ridge coefficients (with sign-only physics correction)
-  AND the composition/property centroid AND the per-target alpha are all
-  re-estimated from the remaining 40 batches only (alpha via an inner
-  LOO on those 47), then the held-out batch's properties are predicted.
-  This is a true nested LOO-CV: no information from the held-out batch
-  leaks into coefficient estimation OR hyperparameter selection.
-
-  IMPORTANT: a "PASS" against the 25%-of-range threshold is NOT on its
-  own evidence of a learned relationship -- see skill-score note above.
-  Report both numbers.
-
-CENTRALIZED CONFIGURATION (single source of truth)
-  N_SYNTHETIC below is the ONLY place the synthetic-sample count needs to
-  be changed. It is passed to build_dataset() in main() and the resulting
-  actual count is written into data/metadata.json under the key
-  "n_synthetic". train_forward_model.py, inverse_design.py, and
-  streamlit_app.py all read that key (or derive the count directly from
-  dataset.csv) at runtime instead of hardcoding a number, so changing
-  N_SYNTHETIC here and re-running the pipeline propagates automatically
-  to every downstream script and to every plot title / caption that
-  reports the sample size.
+  ε(d) ~ N(0, σ_base·(1 + d/d_ref))
 """
 
 import hashlib, json, logging, math, warnings
@@ -145,32 +48,15 @@ OUTDIR  = ROOTDIR / "data"
 PLOTDIR = ROOTDIR / "plots"
 
 # ── Master control: change this ONE number to resize the synthetic dataset ───
-# Every downstream script reads the resulting count from data/metadata.json
-# ("n_synthetic") or directly from dataset.csv, so
-# this is the single source of truth for the whole pipeline.
 N_SYNTHETIC = 200
 
-KMM2_TO_MPA = 9.80665          # kgf/mm² → MPa  (ISO 13006)
+KMM2_TO_MPA = 9.80665
 
-# ── Real Lab Batches — loaded from an external, user-editable CSV ─────────────
+# ── Real Lab Batches ─────────────────────────────────────────────────────────
 LAB_BATCHES_FILE = ROOTDIR / "lab_batches_raw.csv"
 
-def _load_lab_batches(path: Path) -> list:
-    """
-    Load real laboratory calibration batches from a CSV file.
 
-    Required columns
-    -----------------
-    AG98, AG22, AG23, SodaF, PotashF, Crushing, ETP, NaSil
-        Raw composition inputs (wt%, need not already sum to 100 —
-        they are normalised to Sigma = 100 further below).
-    MOR_kgf_mm2
-        Flexural strength as read directly off the tester, kgf/mm2.
-    WA_fraction
-        Water absorption as a fraction (e.g. 0.0359, not 3.59).
-    Shrinkage_pct
-        Fired linear shrinkage, %.
-    """
+def _load_lab_batches(path: Path) -> list:
     if not path.exists():
         raise FileNotFoundError(
             f"Lab batches file not found: {path}\n"
@@ -201,13 +87,13 @@ def _load_lab_batches(path: Path) -> list:
         })
     return batches
 
+
 _LAB_RAW = _load_lab_batches(LAB_BATCHES_FILE)
 
-# ── Data provenance fingerprint ────────────────────────────────────────────────
 DATA_HASH = hashlib.md5(LAB_BATCHES_FILE.read_bytes()).hexdigest()[:8]
 GENERATED_AT = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-MATS = ["AG98","AG22","AG23","SodaF","PotashF","Crushing","ETP","NaSil"]
+MATS = ["AG98", "AG22", "AG23", "SodaF", "PotashF", "Crushing", "ETP", "NaSil"]
 MAT_LABELS = {
     "AG98":     "AG98 (wt%)",
     "AG22":     "AG22 (wt%)",
@@ -223,69 +109,62 @@ TGT_LABELS = {
     "WA_pct":        "Water Absorption (%)",
     "Shrinkage_pct": "Fired Shrinkage (%)",
 }
-TGTS = ["MOR_MPa","WA_pct","Shrinkage_pct"]
-# Order matters: matches the SIGN tuple layout below (MOR, Shrinkage, WA)
+TGTS = ["MOR_MPa", "WA_pct", "Shrinkage_pct"]
 TARGET_SIGN_ORDER = ["MOR_MPa", "Shrinkage_pct", "WA_pct"]
 
-for b in _LAB_RAW:                             # normalise to Σ = 100 wt%
+for b in _LAB_RAW:
     s = sum(b[m] for m in MATS)
     for m in MATS:
         b[m] = b[m] / s * 100.0
 
-lab_df            = pd.DataFrame(_LAB_RAW)
-LAB_MEAN_COMP     = {m: float(lab_df[m].mean()) for m in MATS}
-LAB_MEAN_PROPS    = {t: float(lab_df[t].mean()) for t in TGTS}
+lab_df         = pd.DataFrame(_LAB_RAW)
+LAB_MEAN_COMP  = {m: float(lab_df[m].mean()) for m in MATS}
+LAB_MEAN_PROPS = {t: float(lab_df[t].mean()) for t in TGTS}
 
-# ── Composition feasibility bounds (industrial specification) ─────────────────
 BOUNDS = {
-    "AG98"    : (15.0, 20.0),
-    "AG22"    : (2.5,  4.0),
-    "AG23"    : (10.0, 15.0),
-    "SodaF"   : (37.0, 43.0),
-    "PotashF" : (15.0, 22.0),
+    "AG98":     (15.0, 20.0),
+    "AG22":     (2.5,  4.0),
+    "AG23":     (10.0, 15.0),
+    "SodaF":    (37.0, 43.0),
+    "PotashF":  (15.0, 22.0),
     "Crushing": (2.0,  3.5),
-    "ETP"     : (2.0,  3.1),
-    "NaSil"   : (0.5,  1.5),
+    "ETP":      (2.0,  3.1),
+    "NaSil":    (0.5,  1.5),
 }
 
-# ── Cost (BDT/kg) and CO₂ factors ────────────────────────────────────────────
 COST = {
-    "AG98": 6.95,   "AG22": 8.37,  "AG23": 7.024,
+    "AG98": 6.95,   "AG22": 8.37,   "AG23": 7.024,
     "SodaF": 8.887, "PotashF": 6.241,
-    "Crushing": 0.0, "ETP": 0.0,   "NaSil": 23.369,
+    "Crushing": 0.0, "ETP": 0.0,    "NaSil": 23.369,
 }
 CO2 = {
-    "AG98":(0.129,0.129),
-    "AG22":(0.129,0.129),
-    "AG23":(0.129,0.129),
-    "SodaF":(0.053,0.053),
-    "PotashF":(0.0286,0.0286),
-    "Crushing":(0.587,0.587),
-    "ETP":(0.242,0.242),
-    "NaSil":(0.433,0.433),
+    "AG98": (0.129, 0.129),
+    "AG22": (0.129, 0.129),
+    "AG23": (0.129, 0.129),
+    "SodaF": (0.053, 0.053),
+    "PotashF": (0.0286, 0.0286),
+    "Crushing": (0.587, 0.587),
+    "ETP": (0.242, 0.242),
+    "NaSil": (0.433, 0.433),
 }
 CO2_MID = {m: float(np.mean(CO2[m])) for m in MATS}
 
-# ── Process parameters (fixed single firing cycle) ───────────────────────────
 PROC = {
-    "press_bar":           100,
-    "dryer_time_min":       45,
-    "kiln_time_min":        90,
-    "kiln_temp_C":        1210,
+    "press_bar": 100,
+    "dryer_time_min": 45,
+    "kiln_time_min": 90,
+    "kiln_temp_C": 1210,
     "calorific_NG_Kcal_Nm3": 8300,
-    "dryer_temp_C":        180.0,
-    "gas_Nm3_per_m2":      1.4115,
-    "green_length_mm":     109.20,
-    "green_width_mm":       54.60,
-    "green_thickness_mm":    9.80,
-    "green_weight_g":       98.50,
-    "fired_length_mm":      98.00,
-    "fired_weight_g":       95.05,
+    "dryer_temp_C": 180.0,
+    "gas_Nm3_per_m2": 1.4115,
+    "green_length_mm": 109.20,
+    "green_width_mm": 54.60,
+    "green_thickness_mm": 9.80,
+    "green_weight_g": 98.50,
+    "fired_length_mm": 98.00,
+    "fired_weight_g": 95.05,
 }
 
-# ── Non-linear interaction coefficients (calibrated on PREVIOUS batch set) ────
-# NOTE: still fixed constants, not fitted regressors, and not yet refit
-# against the current lab_batches_raw.csv. See RECALIBRATION NOTE above.
 INTERACTION_COEFF = {
     "MOR_MPa":       -0.08,
     "Shrinkage_pct":  0.012,
@@ -297,15 +176,14 @@ AG98_QUAD_COEFF = {
     "WA_pct":         0.0,
 }
 
-# ── Sign priors (physics direction only — no magnitude floor) ────────────────
-SIGN = {"AG98":(+1,+1,-1),"AG22":(+1,+1,-1),"AG23":(+1,+1,-1),
-        "SodaF":(-1,-1,+1),"PotashF":(-1,-1,+1),
-        "Crushing":(+1,-1,-1),"ETP":(+1,+1,-1),"NaSil":(0,0,0)}
-# tuple order per material: (MOR, Shrinkage, WA)
+SIGN = {"AG98": (+1, +1, -1), "AG22": (+1, +1, -1), "AG23": (+1, +1, -1),
+        "SodaF": (-1, -1, +1), "PotashF": (-1, -1, +1),
+        "Crushing": (+1, -1, -1), "ETP": (+1, +1, -1), "NaSil": (0, 0, 0)}
 
 ALPHA_GRID = [0.01, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0]
 
-# ── Ridge regression: single-target fit at a given alpha ─────────────────────
+
+# ── Ridge regression helpers ─────────────────────────────────────────────────
 def _fit_ridge_one_target(src: pd.DataFrame, alpha: float, target: str) -> np.ndarray:
     X_c = src[MATS].values
     X_c = X_c - X_c.mean(axis=0, keepdims=True)
@@ -313,8 +191,8 @@ def _fit_ridge_one_target(src: pd.DataFrame, alpha: float, target: str) -> np.nd
     y_c = src[target].values - src[target].mean()
     return np.linalg.solve(A, X_c.T @ y_c)
 
+
 def _apply_sign_only(coef_vec: np.ndarray, target: str) -> np.ndarray:
-    """Flip sign to match sintering-physics prior; NO magnitude floor."""
     idx = TARGET_SIGN_ORDER.index(target)
     out = coef_vec.copy()
     for i, m in enumerate(MATS):
@@ -323,8 +201,8 @@ def _apply_sign_only(coef_vec: np.ndarray, target: str) -> np.ndarray:
             out[i] = abs(out[i]) * s
     return out
 
+
 def _inner_loo_mae(train_df: pd.DataFrame, alpha: float, target: str) -> float:
-    """Inner LOO-CV used only to select alpha — never sees the outer test point."""
     errs = []
     n = len(train_df)
     for j in range(n):
@@ -340,9 +218,8 @@ def _inner_loo_mae(train_df: pd.DataFrame, alpha: float, target: str) -> float:
         errs.append(abs(pred - inner_test[target]))
     return float(np.mean(errs))
 
+
 def _select_alpha_nested(train_df: pd.DataFrame, target: str) -> float:
-    """Choose alpha via inner LOO on train_df only (grid capped at 10.0 —
-    see module docstring for why an unbounded search is invalid here)."""
     best_alpha, best_mae = ALPHA_GRID[0], np.inf
     for a in ALPHA_GRID:
         mae = _inner_loo_mae(train_df, a, target)
@@ -350,22 +227,9 @@ def _select_alpha_nested(train_df: pd.DataFrame, target: str) -> float:
             best_mae, best_alpha = mae, a
     return best_alpha
 
+
 def _fit_ridge_coefficients(lab_subset: pd.DataFrame = None,
                              alphas: dict = None) -> dict:
-    """
-    Fit sign-corrected Ridge coefficients per material, per target.
-
-    Parameters
-    ----------
-    lab_subset : pd.DataFrame, optional
-        Lab batches to fit on. Defaults to the full 41-batch ``lab_df``.
-    alphas : dict, optional
-        {target: alpha} to use. If None, alpha is selected per target via
-        nested LOO-CV on ``lab_subset`` itself (used for the production
-        fit on all 41 batches). When this function is called from within
-        validate_physics()'s outer LOO loop, the caller passes alphas
-        already selected on the training fold only, to avoid leakage.
-    """
     src = lab_subset if lab_subset is not None else lab_df
     if alphas is None:
         alphas = {t: _select_alpha_nested(src, t) for t in TGTS}
@@ -378,6 +242,7 @@ def _fit_ridge_coefficients(lab_subset: pd.DataFrame = None,
               for i, m in enumerate(MATS)}
     return coeffs, alphas
 
+
 PHYSICS_COEFF, PHYSICS_ALPHAS = _fit_ridge_coefficients()
 logger.info("Production Ridge alphas selected via nested LOO-CV: %s",
             PHYSICS_ALPHAS)
@@ -386,21 +251,16 @@ _RANGE     = np.array([BOUNDS[m][1] - BOUNDS[m][0] for m in MATS])
 _LAB_XNORM = lab_df[MATS].values / _RANGE
 _D_REF     = float(np.median([
     np.linalg.norm(_LAB_XNORM[i] - _LAB_XNORM[j])
-    for i in range(len(_LAB_RAW)) for j in range(i+1, len(_LAB_RAW))
+    for i in range(len(_LAB_RAW)) for j in range(i + 1, len(_LAB_RAW))
 ]))
+
 
 def _dist(comp: np.ndarray, k: int = 3) -> float:
     d = np.linalg.norm(_LAB_XNORM - comp / _RANGE, axis=1)
     return float(np.sort(d)[:k].mean())
 
-def _physics_pred(cd: dict) -> dict:
-    """
-    Non-linear physics surrogate.
 
-    1. Linear terms: sign-corrected Ridge coefficients (per material).
-    2. Clay–Feldspar interaction (fixed constant).
-    3. AG98 quadratic (fixed constant).
-    """
+def _physics_pred(cd: dict) -> dict:
     p = {t: LAB_MEAN_PROPS[t] for t in TGTS}
 
     for m, (cs, cw, cm) in PHYSICS_COEFF.items():
@@ -424,9 +284,12 @@ def _physics_pred(cd: dict) -> dict:
 
     return p
 
+
 def _sample_comps(n: int) -> np.ndarray:
-    """Rejection-sample on the simplex: all 8 materials within BOUNDS, Σ = 100."""
-    free   = ["AG98","AG22","AG23","PotashF","Crushing","ETP","NaSil"]
+    """Rejection-sample on the simplex. Returns (n, 8) array; (0, 8) when n==0."""
+    if n <= 0:
+        return np.zeros((0, len(MATS)))
+    free   = ["AG98", "AG22", "AG23", "PotashF", "Crushing", "ETP", "NaSil"]
     lo     = np.array([BOUNDS[k][0] for k in free])
     hi     = np.array([BOUNDS[k][1] for k in free])
     lo_s, hi_s = BOUNDS["SodaF"]
@@ -439,27 +302,29 @@ def _sample_comps(n: int) -> np.ndarray:
             out.append([c[m] for m in MATS])
     return np.array(out)
 
+
 def build_dataset(n_synthetic: int = N_SYNTHETIC) -> pd.DataFrame:
     noise_base = {t: (lab_df[t].max() - lab_df[t].min()) * 0.04 for t in TGTS}
-    clip_lo    = {t: lab_df[t].min()        for t in TGTS}
-    clip_hi    = {t: lab_df[t].max() * 1.10 for t in TGTS}
+    clip_lo    = {t: lab_df[t].min()           for t in TGTS}
+    clip_hi    = {t: lab_df[t].max() * 1.10    for t in TGTS}
     rows = []
 
-    for comp in _sample_comps(n_synthetic):
-        cd  = dict(zip(MATS, comp))
-        yp  = _physics_pred(cd)
-        d   = _dist(comp)
-        row = {f"{m}_wtpct": cd[m] for m in MATS}
-        for t in TGTS:
-            row[t] = float(np.clip(
-                yp[t] + rng.normal(0, noise_base[t] * (1 + d / _D_REF)),
-                clip_lo[t], clip_hi[t]
-            ))
-        row["cost_Tk_per_kg"] = sum(cd[m] / 100 * COST[m] for m in MATS)
-        row["CO2_kg_per_kg"]  = sum(cd[m] / 100 * CO2_MID[m] for m in MATS)
-        row["source"] = "synthetic"
-        row.update(PROC)
-        rows.append(row)
+    if n_synthetic > 0:
+        for comp in _sample_comps(n_synthetic):
+            cd  = dict(zip(MATS, comp))
+            yp  = _physics_pred(cd)
+            d   = _dist(comp)
+            row = {f"{m}_wtpct": cd[m] for m in MATS}
+            for t in TGTS:
+                row[t] = float(np.clip(
+                    yp[t] + rng.normal(0, noise_base[t] * (1 + d / _D_REF)),
+                    clip_lo[t], clip_hi[t]
+                ))
+            row["cost_Tk_per_kg"] = sum(cd[m] / 100 * COST[m]    for m in MATS)
+            row["CO2_kg_per_kg"]  = sum(cd[m] / 100 * CO2_MID[m] for m in MATS)
+            row["source"] = "synthetic"
+            row.update(PROC)
+            rows.append(row)
 
     for b in _LAB_RAW:
         cd  = {m: b[m] for m in MATS}
@@ -479,31 +344,12 @@ def build_dataset(n_synthetic: int = N_SYNTHETIC) -> pd.DataFrame:
     df = pd.DataFrame(rows)
     return df[[c for c in cols if c in df.columns]]
 
-# ── Surrogate fidelity: nested Leave-One-Out CV on all lab batches ───────────
+
+# ── Surrogate fidelity: nested LOO-CV ────────────────────────────────────────
 def validate_physics(df: pd.DataFrame) -> bool:
-    """
-    Nested Leave-One-Out cross-validation on the laboratory batches.
-
-    For each held-out batch:
-      - alpha per target is selected via an INNER LOO on the remaining
-        n-1 batches only (never sees the held-out point),
-      - Ridge coefficients (sign-corrected) and the composition/property
-        centroid are refit on those same n-1 batches,
-      - the held-out batch's properties are predicted.
-
-    Alongside the usual MAE/range percentage, this also reports a SKILL
-    SCORE relative to a trivial "predict the training-fold mean, ignore
-    composition" baseline:
-        skill = 1 - MAE_model / MAE_baseline
-    skill > 0 means the model beats the baseline; skill <= 0 means the
-    model provides no benefit over ignoring composition entirely. This
-    is reported explicitly because the MAE/range threshold alone can be
-    satisfied by a model that has effectively degenerated to the
-    baseline (see module docstring).
-    """
-    loo_errors     = {t: [] for t in TGTS}
+    loo_errors      = {t: [] for t in TGTS}
     baseline_errors = {t: [] for t in TGTS}
-    chosen_alphas  = {t: [] for t in TGTS}
+    chosen_alphas   = {t: [] for t in TGTS}
 
     for i in range(len(_LAB_RAW)):
         train_rows = [b for j, b in enumerate(_LAB_RAW) if j != i]
@@ -513,7 +359,6 @@ def validate_physics(df: pd.DataFrame) -> bool:
         train_mean_comp  = {m: float(train_df[m].mean()) for m in MATS}
         train_mean_props = {t: float(train_df[t].mean()) for t in TGTS}
 
-        # Alpha selected on the training fold only (nested — no leakage)
         fold_alphas = {t: _select_alpha_nested(train_df, t) for t in TGTS}
         fold_coeff, _ = _fit_ridge_coefficients(lab_subset=train_df,
                                                  alphas=fold_alphas)
@@ -566,15 +411,31 @@ def validate_physics(df: pd.DataFrame) -> bool:
         )
     return all_pass
 
-# ── Save outputs ──────────────────────────────────────────────────────────────
+
+# ── Save outputs ─────────────────────────────────────────────────────────────
 def save(df: pd.DataFrame) -> None:
     OUTDIR.mkdir(parents=True, exist_ok=True)
     lab_df.to_csv(OUTDIR / "lab_batches.csv", index=False)
     df.to_csv(OUTDIR / "dataset.csv", index=False)
+
     df_s = df[df.source == "synthetic"]
+    if len(df_s) == 0:
+        # Fallback: report lab-batch ranges when no synthetic rows exist
+        df_s = df[df.source == "lab_batch"]
+        ranges_source = "lab_batch"
+    else:
+        ranges_source = "synthetic"
+
     with open(OUTDIR / "property_ranges.json", "w") as f:
-        json.dump({f"{t}_{k}": float(getattr(df_s[t], k)())
-                   for t in TGTS for k in ("min", "max")}, f, indent=2)
+        json.dump(
+            {
+                "source": ranges_source,
+                **{f"{t}_{k}": float(getattr(df_s[t], k)())
+                   for t in TGTS for k in ("min", "max")},
+            },
+            f, indent=2,
+        )
+
     meta = {
         "materials": MATS, "targets": TGTS, "bounds": BOUNDS,
         "cost_tk_per_kg": COST,
@@ -582,10 +443,6 @@ def save(df: pd.DataFrame) -> None:
         "co2_midpoint": CO2_MID,
         "proc_defaults": PROC,
         "n_lab_batches": len(_LAB_RAW),
-        # Single source of truth for every downstream script: the ACTUAL
-        # number of synthetic rows produced this run (derived from
-        # N_SYNTHETIC / whatever value was passed to build_dataset()),
-        # never a hardcoded literal.
         "n_synthetic": int((df.source == "synthetic").sum()),
         "generation_method": (
             "Physics-informed non-linear surrogate. "
@@ -622,13 +479,15 @@ def save(df: pd.DataFrame) -> None:
     }
     with open(OUTDIR / "metadata.json", "w") as f:
         json.dump(meta, f, indent=2)
+
     logger.info("Saved  %d rows  (synthetic=%d  lab=%d)",
                 len(df),
                 int((df.source == "synthetic").sum()),
                 int((df.source == "lab_batch").sum()))
 
+
 # ══════════════════════════════════════════════════════════════════════════════
-# FIGURES  (unchanged from prior version, except dynamic sample-size labels)
+# FIGURES — all functions degrade gracefully when n_synthetic == 0
 # ══════════════════════════════════════════════════════════════════════════════
 _FS_TITLE  = 18
 _FS_AX     = 16
@@ -637,47 +496,88 @@ _FS_LABEL  = 13
 _FS_ANNOT  = 12
 _DPI       = 300
 
+
 def _savefig(fig, stem: str) -> None:
     for ext in ("pdf", "png"):
         fig.savefig(PLOTDIR / f"{stem}.{ext}", dpi=_DPI, bbox_inches="tight")
     plt.close(fig)
+
+
+def _pick_plot_source(df: pd.DataFrame):
+    """
+    Choose the rows that figures should be built from.
+
+    Returns (subset_df, source_label, n_rows).
+    Preference order: synthetic if non-empty → lab_batch otherwise.
+    """
+    ds = df[df.source == "synthetic"]
+    if len(ds) > 0:
+        return ds, "Training Dataset (synthetic)", len(ds)
+    ds = df[df.source == "lab_batch"]
+    return ds, "Experimental Batches", len(ds)
+
 
 def plot_distributions(df: pd.DataFrame) -> None:
     comp_cols  = [f"{m}_wtpct" for m in MATS]
     all_cols   = comp_cols + TGTS
     all_labels = [MAT_LABELS[m] for m in MATS] + [TGT_LABELS[t] for t in TGTS]
 
-    nrows = 3; ncols = math.ceil(len(all_cols) / nrows)
+    ds, source_label, n_actual = _pick_plot_source(df)
+
+    nrows = 3
+    ncols = math.ceil(len(all_cols) / nrows)
     pal   = sns.color_palette("husl", len(all_cols) + 2)
-    fig, axes = plt.subplots(nrows, ncols,
-                              figsize=(ncols * 5, nrows * 4.2))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 5, nrows * 4.2))
     axes = axes.flatten()
 
-    ds = df[df.source == "synthetic"]
-    n_synth_actual = len(ds)   # actual count, never hardcoded
     for i, (col, label) in enumerate(zip(all_cols, all_labels)):
-        ax   = axes[i]
-        data = ds[col].clip(ds[col].quantile(0.01), ds[col].quantile(0.99))
-        sns.histplot(data, bins="auto", kde=True, color=pal[i],
+        ax = axes[i]
+        vals = ds[col].dropna()
+
+        if len(vals) == 0:
+            ax.text(0.5, 0.5, "No data", ha="center", va="center",
+                    transform=ax.transAxes, fontsize=_FS_LABEL, color="gray")
+            ax.set_xlabel(label, fontsize=_FS_AX)
+            ax.set_ylabel("Frequency", fontsize=_FS_AX)
+            ax.tick_params(labelsize=_FS_TICK)
+            ax.text(0.5, -0.28, f"({chr(97 + i)})",
+                    transform=ax.transAxes, ha="center",
+                    fontsize=_FS_LABEL, fontweight="bold")
+            continue
+
+        # Robust clipping only when we have enough points
+        if len(vals) >= 5:
+            data = vals.clip(vals.quantile(0.01), vals.quantile(0.99))
+        else:
+            data = vals
+
+        # KDE needs ≥ 2 distinct points with non-zero variance
+        use_kde = (len(data) >= 2) and (data.nunique() >= 2)
+        sns.histplot(data, bins="auto", kde=use_kde, color=pal[i],
                      ax=ax, edgecolor="white")
         for ln in ax.get_lines():
             ln.set_linewidth(2.0); ln.set_alpha(0.85)
+
         ax.set_xlabel(label, fontsize=_FS_AX)
         ax.set_ylabel("Frequency", fontsize=_FS_AX)
         ax.tick_params(labelsize=_FS_TICK)
         ax.text(0.5, -0.28, f"({chr(97 + i)})",
                 transform=ax.transAxes, ha="center",
                 fontsize=_FS_LABEL, fontweight="bold")
+
     for i in range(len(all_cols), len(axes)):
         axes[i].axis("off")
+
     fig.suptitle(
-        "Feature and Target Distributions of the Synthetic Training Dataset"
-        f" (n = {n_synth_actual:,})",
-        fontsize=_FS_TITLE, fontweight="bold", y=1.02
+        f"Feature and Target Distributions — {source_label}"
+        f" (n = {n_actual:,})",
+        fontsize=24, fontweight="bold", y=1.02,
     )
     plt.tight_layout(h_pad=5.5, w_pad=3.0)
     _savefig(fig, "all_distributions")
-    logger.info("Saved: all_distributions.pdf / .png")
+    logger.info("Saved: all_distributions.pdf / .png  (source=%s, n=%d)",
+                source_label, n_actual)
+
 
 def plot_source_stripplot(df: pd.DataFrame) -> None:
     colors  = {"synthetic": "#2196F3", "lab_batch": "#E53935"}
@@ -685,42 +585,66 @@ def plot_source_stripplot(df: pd.DataFrame) -> None:
     sizes   = {"synthetic": 35,         "lab_batch": 180}
     _rng    = np.random.default_rng(0)
 
+    has_synth = (df.source == "synthetic").sum() > 0
+    has_lab   = (df.source == "lab_batch").sum() > 0
+    # If synthetic is empty, drop it from the legend/labels — don't draw an
+    # empty panel column that would mislead the reader.
+    active_sources = [s for s in ("synthetic", "lab_batch")
+                      if (df.source == s).sum() > 0]
+    if not active_sources:
+        logger.warning("plot_source_stripplot: no rows to plot; skipping")
+        return
+
+    # One x-tick per active source (1 or 2 columns)
+    x_positions = {s: i for i, s in enumerate(active_sources)}
+
     fig, axes = plt.subplots(1, 3, figsize=(18, 7))
     for ax, t in zip(axes, TGTS):
-        for i, (src, color) in enumerate(colors.items()):
-            vals   = df[df.source == src][t].values
+        for src in active_sources:
+            color = colors[src]
+            vals  = df[df.source == src][t].values
+            if len(vals) == 0:
+                continue
+            xpos  = x_positions[src]
             jitter = _rng.uniform(-0.12, 0.12, len(vals))
             ax.scatter(
-                np.full(len(vals), i) + jitter, vals,
+                np.full(len(vals), xpos) + jitter, vals,
                 color=color,
                 alpha=0.50 if src == "synthetic" else 0.95,
                 s=sizes[src], marker=markers[src],
-                label=("Synthetic" if src == "synthetic" else "Experimental"),
+                label=("Synthetic" if src == "synthetic"
+                       else "Experimental"),
                 zorder=3 if src == "lab_batch" else 2,
             )
-            ax.hlines(vals.mean(), i - 0.30, i + 0.30,
+            ax.hlines(vals.mean(), xpos - 0.30, xpos + 0.30,
                       colors=color, linewidth=2.5, linestyle="--", alpha=0.85)
 
-        syn_vals = df[df.source == "synthetic"][t].values
-        lab_vals = df[df.source == "lab_batch"][t].values
-        try:
-            _, p_mw = mannwhitneyu(syn_vals, lab_vals, alternative="two-sided")
-            ax.text(0.98, 0.03, f"MWU p = {p_mw:.3f}",
-                    transform=ax.transAxes, ha="right", va="bottom",
-                    fontsize=_FS_ANNOT, color="gray",
-                    bbox=dict(boxstyle="round,pad=0.3", facecolor="white",
-                              alpha=0.75))
-        except Exception:
-            pass
+        # Mann–Whitney U only when both groups actually have data
+        if has_synth and has_lab:
+            syn_vals = df[df.source == "synthetic"][t].values
+            lab_vals = df[df.source == "lab_batch"][t].values
+            try:
+                _, p_mw = mannwhitneyu(syn_vals, lab_vals,
+                                        alternative="two-sided")
+                ax.text(0.98, 0.03, f"MWU p = {p_mw:.3f}",
+                        transform=ax.transAxes, ha="right", va="bottom",
+                        fontsize=_FS_ANNOT, color="gray",
+                        bbox=dict(boxstyle="round,pad=0.3",
+                                  facecolor="white", alpha=0.75))
+            except Exception:
+                pass
 
-        n_synth_actual = len(syn_vals)
-        n_lab_actual   = len(lab_vals)
-        ax.set_xticks([0, 1])
-        ax.set_xticklabels(
-            [f"Synthetic\n(n = {n_synth_actual:,})",
-             f"Experimental\n(n = {n_lab_actual})"],
-            fontsize=_FS_TICK
-        )
+        # Build xticklabels using actual counts, in the same order as positions
+        xtick_labels = []
+        for src in active_sources:
+            n_src = int((df.source == src).sum())
+            if src == "synthetic":
+                xtick_labels.append(f"Synthetic\n(n = {n_src:,})")
+            else:
+                xtick_labels.append(f"Experimental\n(n = {n_src})")
+
+        ax.set_xticks([x_positions[s] for s in active_sources])
+        ax.set_xticklabels(xtick_labels, fontsize=_FS_TICK)
         ax.set_ylabel(TGT_LABELS[t], fontsize=_FS_AX)
         ax.set_title(TGT_LABELS[t], fontsize=_FS_AX, fontweight="bold")
         ax.tick_params(axis="y", labelsize=_FS_TICK)
@@ -728,21 +652,32 @@ def plot_source_stripplot(df: pd.DataFrame) -> None:
         if t == TGTS[0]:
             ax.legend(fontsize=_FS_LABEL, loc="upper right")
 
+    subtitle = ("(dashed line = group mean;  MWU = Mann–Whitney U test p-value)"
+                if (has_synth and has_lab)
+                else "(dashed line = group mean)")
     fig.suptitle(
-        "Comparison of Property Distributions: Synthetic Dataset vs."
-        " Experimental Batches\n(dashed line = group mean;"
-        "  MWU = Mann–Whitney U test p-value)",
-        fontsize=_FS_TITLE, fontweight="bold"
+        "Comparison of Property Distributions: "
+        "Synthetic Dataset vs. Experimental Batches\n" + subtitle,
+        fontsize=_FS_TITLE, fontweight="bold",
     )
     plt.tight_layout(rect=[0, 0, 1, 0.94])
     _savefig(fig, "source_comparison_stripplot")
     logger.info("Saved: source_comparison_stripplot.pdf / .png")
 
+
 def plot_composition_correlation(df: pd.DataFrame) -> None:
     comp_cols = [f"{m}_wtpct" for m in MATS]
     labels    = [MAT_LABELS[m].replace(" (wt%)", "") for m in MATS]
 
-    ds   = df[df.source == "synthetic"]
+    ds, source_label, n_actual = _pick_plot_source(df)
+
+    # Need at least 2 rows to compute correlations
+    if len(ds) < 2:
+        logger.warning(
+            "plot_composition_correlation: only %d row(s); "
+            "correlation matrix will be degenerate.", len(ds)
+        )
+
     corr = ds[comp_cols].corr()
     corr.columns = labels
     corr.index   = labels
@@ -751,11 +686,12 @@ def plot_composition_correlation(df: pd.DataFrame) -> None:
     sns.heatmap(
         corr, annot=True, fmt=".2f", cmap="coolwarm",
         center=0, vmin=-1, vmax=1,
-        linewidths=0.5, annot_kws={"size": _FS_LABEL}, ax=ax
+        linewidths=0.5, annot_kws={"size": _FS_LABEL}, ax=ax,
+        cbar_kws={"label": "Pearson r"},
     )
     ax.set_title(
         "Pearson Correlation Among Composition Variables\n"
-        "(synthetic dataset; simplex constraint Σwt% = 100\n"
+        f"({source_label}, n = {n_actual:,}; simplex constraint Σwt% = 100\n"
         "induces structural multicollinearity)",
         fontsize=_FS_TITLE, fontweight="bold", pad=16
     )
@@ -763,9 +699,19 @@ def plot_composition_correlation(df: pd.DataFrame) -> None:
     plt.yticks(rotation=0,  fontsize=_FS_TICK)
     plt.tight_layout()
     _savefig(fig, "composition_correlation")
-    logger.info("Saved: composition_correlation.pdf / .png")
+    logger.info("Saved: composition_correlation.pdf / .png  (source=%s, n=%d)",
+                source_label, n_actual)
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+def _safe_call(fn, *args, **kwargs) -> None:
+    """Run a plotting function; log and swallow errors so pipeline never aborts."""
+    try:
+        fn(*args, **kwargs)
+    except Exception as exc:
+        logger.exception("Figure step %s failed: %s", fn.__name__, exc)
+
+
 def main() -> None:
     OUTDIR.mkdir(parents=True, exist_ok=True)
     PLOTDIR.mkdir(parents=True, exist_ok=True)
@@ -783,15 +729,18 @@ def main() -> None:
     save(df)
 
     logger.info("[4/4] Generating figures …")
-    plot_distributions(df)
-    plot_source_stripplot(df)
-    plot_composition_correlation(df)
+    # Ordering note: plot_distributions now degrades to lab batches when the
+    # synthetic set is empty, so the two following figures still get produced.
+    _safe_call(plot_distributions, df)
+    _safe_call(plot_source_stripplot, df)
+    _safe_call(plot_composition_correlation, df)
 
     for t in TGTS:
         logger.info("  %-22s  [%.4f, %.4f]  mean=%.3f  CV=%.2f%%",
                     t, df[t].min(), df[t].max(), df[t].mean(),
                     df[t].std() / df[t].mean() * 100)
     logger.info("Done.")
+
 
 if __name__ == "__main__":
     main()

@@ -19,6 +19,30 @@ METHODS
      Searches the continuous composition space to minimise normalised
      cost + normalised CO2 subject to meeting the target properties.
 
+     GUARDRAIL (added — fixes unrealistic / blown-up results):
+     Each of the 7 free materials is sampled independently across its own
+     bound box, then SodaF is derived and the whole vector renormalised to
+     100 wt%. This can land on a composition that is individually in-bounds
+     for every material yet jointly far outside the correlated region the
+     synthetic generator actually explored (see generate_dataset.py: the
+     simplex constraint Sigma wt% = 100 induces structural multicollinearity).
+     Off that training manifold, a data-driven forward model — especially
+     a linear one, whose near-cancelling coefficients only cancel ON the
+     manifold — can extrapolate to physically nonsensical values (e.g.
+     MOR in the billions). Two penalties now keep the optimiser (and the
+     result it returns) inside the region the model was actually trained
+     on:
+       (a) a composition trust-region penalty: distance from the candidate
+           to its nearest synthetic training point, in units of the
+           typical training-point-to-training-point spacing;
+       (b) a property sanity penalty: how far the model's own predicted
+           MOR/WA/Shrinkage fall outside the observed training range
+           (with a margin).
+     Every trial is tagged "feasible" (both penalties ~0). The final
+     answer is chosen from feasible trials only; if none exist, the least
+     bad trial is returned WITH a warning rather than silently presented
+     as a normal result.
+
 ARCHITECTURE — PREDICTION vs. OPTIMISATION
 -------------------------------------------------------
 Two independent engines live in this framework:
@@ -119,6 +143,49 @@ _prop_scaler: StandardScaler | None = None
 _X_props_sc = None
 _nbrs: NearestNeighbors | None = None
 
+# ── Composition trust-region state (guards Bayesian Optimisation against
+#    extrapolating off the region the forward model was actually trained
+#    on — see GUARDRAIL note in the module docstring) ───────────────────
+_comp_scaler: StandardScaler | None = None
+_X_comp_sc = None
+_comp_nbrs: NearestNeighbors | None = None
+_trust_region_threshold: float = float("inf")  # calibrated in refresh_prices()
+
+# Percentile (of "how far a point drawn from the SAME uniform sampling
+# distribution used to build the synthetic dataset sits from its nearest
+# training neighbour") used as the trust-region boundary. NOTE: this is
+# NOT a multiple of training-to-training spacing — with a modest
+# N_SYNTHETIC in a 7-D composition space, training points are naturally
+# far apart from each other (curse of dimensionality / "empty space"
+# phenomenon), so that self-spacing badly underestimates how far a
+# typical, perfectly reasonable query point sits from its nearest
+# training neighbour. Calibrating against a large empirical sample of
+# points drawn from the box the optimiser actually searches avoids that
+# trap and is what makes the guardrail below actually bind.
+TRUST_REGION_PERCENTILE = 90.0
+# How far outside the observed training property range (as a fraction of
+# that range) a prediction may fall before it is treated as implausible.
+PROPERTY_SANITY_MARGIN = 0.5
+# Penalty weights — large enough to dominate the normal cost/CO2/target
+# terms (which live on an O(1-10) scale) but capped so a single wild
+# trial can't visually wreck the convergence plot.
+EXTRAP_PENALTY_WEIGHT = 10.0
+SANITY_PENALTY_WEIGHT = 20.0
+PENALTY_CAP = 100.0
+
+# Hard backstop, independent of the penalties above: no matter WHY the
+# forward model misbehaves for a given input (numerically unstable
+# architecture, extrapolation, a training/feature bug, ...), nothing
+# downstream of _predict_clamped() can ever surface a value like
+# "MOR = -1.6 billion MPa" again. Predictions are clamped to this many
+# multiples of the observed training range beyond the observed min/max —
+# generous enough to allow real extrapolation, small enough to guarantee
+# a finite, physically-plausible-looking number is always shown. This is
+# a display/objective-function safety net, NOT a substitute for the
+# trust-region and sanity penalties above, which still do the real work
+# of steering the optimiser away from unreliable regions.
+PREDICTION_CLAMP_MULTIPLE = 5.0
+
 
 def refresh_prices() -> None:
     """
@@ -141,6 +208,7 @@ def refresh_prices() -> None:
     global _cost_min, _cost_max, _cost_range
     global _co2_min, _co2_max, _co2_range
     global _prop_scaler, _X_props_sc, _nbrs
+    global _comp_scaler, _X_comp_sc, _comp_nbrs, _trust_region_threshold
 
     cost_dict, cost_meta = load_price_table(
         COST_DIR, keyword="Cost", value_col="Price_Tk_per_kg",
@@ -190,6 +258,49 @@ def refresh_prices() -> None:
         _prop_scaler = StandardScaler()
         _X_props_sc = _prop_scaler.fit_transform(_ds_synth[TARGET_COLS].values)
         _nbrs = NearestNeighbors(n_neighbors=10, algorithm="auto").fit(_X_props_sc)
+
+    # ── Composition trust-region model (fit once — composition space is
+    #    not affected by price, same reasoning as the property NN above) ──
+    if _comp_scaler is None:
+        comp_cols_full = [f"{m}_wtpct" for m in materials]
+        _comp_scaler = StandardScaler()
+        _X_comp_sc = _comp_scaler.fit_transform(_ds_synth[comp_cols_full].values)
+        _comp_nbrs = NearestNeighbors(n_neighbors=1, algorithm="auto").fit(_X_comp_sc)
+
+        # Empirical calibration (see TRUST_REGION_PERCENTILE comment above):
+        # draw a large sample of compositions uniformly over the SAME box
+        # the optimiser searches, using the SAME rejection-sampling scheme
+        # as generate_dataset.py's _sample_comps (independent samples,
+        # SodaF derived from the simplex constraint), then measure how far
+        # each sits from its nearest ACTUAL training point. The threshold
+        # is the chosen percentile of that distribution — i.e. "as far as
+        # it's normal for a typical point in this box to be from the
+        # training data", not an arbitrary fixed radius.
+        free_mats = [m for m in materials if m != "SodaF"]
+        lo_arr = np.array([bounds[m][0] for m in free_mats])
+        hi_arr = np.array([bounds[m][1] for m in free_mats])
+        soda_lo, soda_hi = bounds["SodaF"]
+        n_calib = max(2000, 10 * len(_ds_synth))
+        calib_rng = np.random.default_rng(123)
+        calib_rows: list[list[float]] = []
+        while len(calib_rows) < n_calib:
+            v = calib_rng.uniform(lo_arr, hi_arr)
+            s = 100.0 - v.sum()
+            if soda_lo <= s <= soda_hi:
+                c = dict(zip(free_mats, v))
+                c["SodaF"] = s
+                calib_rows.append([c[m] for m in materials])
+        calib_arr = np.array(calib_rows)
+        calib_sc = _comp_scaler.transform(calib_arr)
+        d_calib, _ = _comp_nbrs.kneighbors(calib_sc, n_neighbors=1)
+        _trust_region_threshold = float(
+            np.percentile(d_calib[:, 0], TRUST_REGION_PERCENTILE)
+        )
+        print(f"  Composition trust-region threshold calibrated: "
+              f"{_trust_region_threshold:.4f} (scaled-distance units; "
+              f"{TRUST_REGION_PERCENTILE:.0f}th percentile over "
+              f"{n_calib} calibration draws vs. {len(_ds_synth)} "
+              "training points)")
 
 
 def get_price_info() -> dict:
@@ -264,14 +375,47 @@ def clamp_targets(MOR: float, WA: float, SH: float) -> tuple[float, float, float
 
 def _enforce_bounds(comp: dict[str, float]) -> dict[str, float]:
     """
-    Clip each material to its individual feasibility bounds then renormalise
-    to sum = 100 wt%. A second renormalisation step is required because
-    clipping can push the batch sum away from 100.
+    Project `comp` onto {sum = 100, bounds[m][0] <= x_m <= bounds[m][1]}.
+
+    A naive "clip each material then rescale by total/100" (the original
+    approach) can push a material that was clipped right at its bound
+    back OUTSIDE that bound once the rescale factor is applied — e.g. if
+    the clipped values sum to 95, scaling everything up by 100/95 will
+    push a material sitting at its upper bound to 1.0526x that bound.
+    This is exactly how a reported "SodaF = 44.85%" slipped out despite
+    SodaF's bound being (37, 43): it was clipped to 43, then the rescale
+    pushed it back up.
+
+    Instead, redistribute the shortfall/excess iteratively ("water-
+    filling"), each round spreading it only across materials that still
+    have headroom in the needed direction, so no material ever ends the
+    projection outside its own bound.
     """
-    clipped = {m: float(np.clip(comp[m], bounds[m][0], bounds[m][1]))
-               for m in materials}
-    total = sum(clipped.values())
-    return {m: v / total * 100.0 for m, v in clipped.items()}
+    lo = {m: bounds[m][0] for m in materials}
+    hi = {m: bounds[m][1] for m in materials}
+    x = {m: float(np.clip(comp[m], lo[m], hi[m])) for m in materials}
+
+    for _ in range(100):
+        diff = 100.0 - sum(x.values())
+        if abs(diff) < 1e-9:
+            break
+        if diff > 0:
+            room = {m: hi[m] - x[m] for m in materials if hi[m] - x[m] > 1e-12}
+        else:
+            room = {m: x[m] - lo[m] for m in materials if x[m] - lo[m] > 1e-12}
+        room_total = sum(room.values())
+        if not room or room_total <= 1e-12:
+            # Bounds themselves can't reach sum=100 (shouldn't happen with
+            # this dataset's bounds, but fail safe rather than violate a
+            # bound): stop here rather than push anything out of range.
+            break
+        for m, r in room.items():
+            x[m] += diff * (r / room_total)
+        # Re-clip for float safety, then loop again to redistribute any
+        # residual caused by the re-clip.
+        x = {m: float(np.clip(x[m], lo[m], hi[m])) for m in materials}
+
+    return x
 
 
 def _summarize(row: pd.Series) -> dict:
@@ -329,6 +473,86 @@ def inverse_optimized(MOR_MPa: float, WA_pct: float,
     return _summarize(_ds_synth.loc[best_iloc]), identical
 
 
+def _composition_extrapolation_score(comp: dict[str, float]) -> float:
+    """
+    Scaled Euclidean distance from `comp` to its nearest neighbour in the
+    synthetic training composition set. Compare against
+    `_trust_region_threshold` (calibrated in refresh_prices() against the
+    SAME box the optimiser searches — see TRUST_REGION_PERCENTILE
+    comment) rather than any fixed constant: distances by themselves
+    aren't meaningfully interpretable without that calibration.
+    """
+    x = np.array([[comp[m] for m in materials]])
+    x_sc = _comp_scaler.transform(x)
+    d, _ = _comp_nbrs.kneighbors(x_sc, n_neighbors=1)
+    return float(d[0][0])
+
+
+def _property_sanity_penalty(MOR_p: float, WA_p: float, SH_p: float) -> float:
+    """
+    How far predicted properties fall outside the observed training
+    range (each expressed as a multiple of that property's own range,
+    with PROPERTY_SANITY_MARGIN of slack before any penalty starts).
+    Zero when all three predictions are within the (slightly widened)
+    training range; grows without bound the further a prediction
+    (e.g. a blown-up extrapolation) strays from anything physically
+    plausible for this dataset.
+    """
+    pen = 0.0
+    for val, key in (
+        (MOR_p, "MOR_MPa"), (WA_p, "WA_pct"), (SH_p, "Shrinkage_pct")
+    ):
+        lo, hi = _pr[f"{key}_min"], _pr[f"{key}_max"]
+        rng = _prop_ranges[key]
+        margin = rng * PROPERTY_SANITY_MARGIN
+        if val < lo - margin:
+            pen += (lo - margin - val) / rng
+        elif val > hi + margin:
+            pen += (val - hi - margin) / rng
+    return pen
+
+
+def _predict_clamped(comp: dict[str, float]) -> tuple[np.ndarray, np.ndarray]:
+    """
+    The ONLY place inverse_design.py calls forward_model.predict(). Returns
+    (raw, clamped):
+      raw     — the model's unmodified output, used for the sanity-penalty
+                check (it needs to see how bad an input really is in order
+                to steer the optimiser away from it).
+      clamped — the same prediction, hard-clipped to
+                [obs_min - PREDICTION_CLAMP_MULTIPLE*range,
+                 obs_max + PREDICTION_CLAMP_MULTIPLE*range] for each
+                property. Used for the target-matching penalty and for
+                anything actually displayed to the user, so a misbehaving
+                model can degrade to "an implausible but finite number"
+                at worst, never a billion-scale value.
+    """
+    raw = np.asarray(forward_model.predict(build_input_row(comp))[0], dtype=float)
+    clamped = np.empty_like(raw)
+    for i, key in enumerate(TARGET_COLS):
+        lo, hi = _pr[f"{key}_min"], _pr[f"{key}_max"]
+        rng = _prop_ranges[key]
+        clamped[i] = float(np.clip(
+            raw[i],
+            lo - PREDICTION_CLAMP_MULTIPLE * rng,
+            hi + PREDICTION_CLAMP_MULTIPLE * rng,
+        ))
+    # Hard physical floor — independent of, and in addition to, the
+    # trust-region/sanity penalties above. Those penalties steer the
+    # OPTIMISER away from bad regions; they do not, by themselves,
+    # prevent a physically-impossible value from being the one that gets
+    # displayed when every trial for a given target is infeasible (the
+    # "least-bad trial" fallback). No matter how the guardrails above are
+    # tuned, a negative flexural strength or negative water absorption
+    # can never be a real ceramic property, so these two are floored at
+    # zero unconditionally. Shrinkage is left unclamped here since
+    # (slight) expansion is physically possible and reported as a
+    # negative value in some conventions.
+    clamped[0] = max(clamped[0], 0.0)  # MOR_MPa
+    clamped[1] = max(clamped[1], 0.0)  # WA_pct
+    return raw, clamped
+
+
 def inverse_bayesian_optimization(
     MOR_MPa_tgt: float,
     WA_tgt: float,
@@ -364,7 +588,7 @@ def inverse_bayesian_optimization(
 
         comp = _enforce_bounds(comp)
 
-        pred = forward_model.predict(build_input_row(comp))[0]
+        raw_pred, pred = _predict_clamped(comp)
         MOR_p, WA_p, SH_p = pred[0], pred[1], pred[2]
 
         cost = sum(comp[m] / 100 * cost_dict[m] for m in materials)
@@ -374,12 +598,26 @@ def inverse_bayesian_optimization(
         norm_co2 = (co2 - _co2_min) / _co2_range
 
         penalty = (
-            max(0.0, MOR_MPa_tgt - MOR_p) / _prop_ranges["MOR_MPa"] * 5.0
-            + max(0.0, WA_p - WA_tgt) / _prop_ranges["WA_pct"] * 5.0
+            abs(MOR_p - MOR_MPa_tgt) / _prop_ranges["MOR_MPa"] * 5.0
+            + abs(WA_p - WA_tgt) / _prop_ranges["WA_pct"] * 5.0
             + abs(SH_p - Shrink_tgt) / _prop_ranges["Shrinkage_pct"] * 5.0
             + soda_pen
         )
-        obj = norm_cost + norm_co2 + penalty
+
+        # ── Trust-region + sanity guardrails (see module docstring) ────
+        extrap_score = _composition_extrapolation_score(comp)
+        extrap_overflow = max(0.0, extrap_score - _trust_region_threshold)
+        extrap_overflow_norm = extrap_overflow / max(_trust_region_threshold, 1e-9)
+        extrap_pen = min(extrap_overflow_norm * EXTRAP_PENALTY_WEIGHT, PENALTY_CAP)
+
+        sanity_raw = _property_sanity_penalty(raw_pred[0], raw_pred[1], raw_pred[2])
+        sanity_pen = min(sanity_raw * SANITY_PENALTY_WEIGHT, PENALTY_CAP)
+
+        feasible = (extrap_overflow == 0.0) and (sanity_raw == 0.0)
+        trial.set_user_attr("feasible", feasible)
+        trial.set_user_attr("extrapolation_score", extrap_score)
+
+        obj = norm_cost + norm_co2 + penalty + extrap_pen + sanity_pen
         trial_vals.append(obj)
         return obj
 
@@ -387,7 +625,34 @@ def inverse_bayesian_optimization(
     study = optuna.create_study(direction="minimize", sampler=sampler)
     study.optimize(_objective, n_trials=n_trials, show_progress_bar=False)
 
-    best = study.best_trial.params
+    # ── Select the final answer from FEASIBLE trials only ──────────────
+    # study.best_trial alone is not safe to use here: with a fixed set of
+    # penalty weights it is theoretically possible (though the weights
+    # above are chosen to make it rare in practice) for an infeasible,
+    # off-manifold trial to still score lowest on raw objective value
+    # before the cap is reached. Filtering to feasible trials is what
+    # actually guarantees the returned composition sits inside the region
+    # the forward model was trained on.
+    feasible_trials = [
+        t for t in study.trials
+        if t.value is not None and t.user_attrs.get("feasible", False)
+    ]
+    warning_msg = None
+    if feasible_trials:
+        best_trial = min(feasible_trials, key=lambda t: t.value)
+    else:
+        best_trial = study.best_trial
+        warning_msg = (
+            "Bayesian Optimisation found NO composition within the trust "
+            "region of the training data for this target across "
+            f"{n_trials} trials. Returning the least-bad trial found, but "
+            "treat this result with caution: consider relaxing the "
+            "target, increasing n_trials, or expanding the training "
+            "dataset to cover this region."
+        )
+        warnings.warn(warning_msg)
+
+    best = best_trial.params
     best_c = {m: best[f"c_{m}"] for m in materials if m != "SodaF"}
     best_c["SodaF"] = float(np.clip(
         100.0 - sum(best_c.values()),
@@ -395,9 +660,16 @@ def inverse_bayesian_optimization(
     ))
     best_c = _enforce_bounds(best_c)
 
-    pred = forward_model.predict(build_input_row(best_c))[0]
+    _, pred = _predict_clamped(best_c)
     cost = sum(best_c[m] / 100 * cost_dict[m] for m in materials)
     co2 = sum(best_c[m] / 100 * co2_dict[m] for m in materials)
+
+    n_feasible = len(feasible_trials)
+    print(f"  Bayesian Optimisation: {n_feasible}/{n_trials} trials were "
+          "inside the training trust region; result selected from those."
+          if n_feasible else
+          f"  Bayesian Optimisation: 0/{n_trials} trials were inside the "
+          "training trust region — see warning above.")
 
     result = {
         "composition_wtpct": {m: round(best_c[m], 4) for m in materials},
@@ -408,5 +680,9 @@ def inverse_bayesian_optimization(
         },
         "cost_Tk_per_kg": round(cost, 4),
         "CO2_kg_per_kg": round(co2, 5),
+        "feasible": bool(feasible_trials),
+        "n_feasible_trials": n_feasible,
+        "n_trials": n_trials,
+        "warning": warning_msg,
     }
     return result, trial_vals, study

@@ -486,8 +486,10 @@ with tabs[1]:
 with tabs[2]:
     st.markdown(
         "Searches the **continuous composition space** using Optuna Bayesian "
-        "optimisation to minimise normalised cost + normalised CO2 subject to "
-        "meeting the target properties, using the **latest** price/CO2 "
+        "optimisation to minimise normalised cost + normalised CO2 while "
+        "tracking the target properties as closely as possible (MOR, WA, and "
+        "Shrinkage are all penalised symmetrically — over- and under-shooting "
+        "the target are equally penalised), using the **latest** price/CO2 "
         "database. Unlike the nearest-neighbour methods, Bayesian "
         "optimisation can identify compositions not present in the "
         "dataset, enabling genuinely improved cost and CO2 performance. "
@@ -514,6 +516,26 @@ with tabs[2]:
         res = st.session_state["res_bay"]
         tgt = st.session_state["tgt_bay"]
         trial_vals = st.session_state["trial_vals"]
+
+        # Trust-region guardrail feedback (see inverse_design.py docstring).
+        # A result flagged infeasible means no trial landed close enough to
+        # the training data for this target — the composition below is the
+        # least-bad one found and should not be trusted as-is.
+        if not res.get("feasible", True):
+            st.error(
+                "No composition within the training data's trust region "
+                "was found for this target after "
+                f"{res.get('n_trials', '?')} trials. The result below is "
+                "the least-bad candidate only — try relaxing the target, "
+                "increasing the trial count, or expanding the training "
+                "dataset."
+            )
+        elif res.get("n_feasible_trials") is not None:
+            st.caption(
+                f"{res['n_feasible_trials']}/{res['n_trials']} trials "
+                "landed inside the training data's trust region; the "
+                "recommendation below was selected from those."
+            )
 
         st.markdown("#### Recommended Composition")
         st.dataframe(_table(res), use_container_width=True)
@@ -554,17 +576,6 @@ with tabs[2]:
         col_a.metric("Batch cost", f"{res['cost_Tk_per_kg']:.4f} Tk/kg")
         col_b.metric("CO2 emission", f"{res['CO2_kg_per_kg']:.5f} kg/kg")
 
-        wa_pred = res["predicted"]["WA_pct"]
-        wa_tgt = tgt["WA_pct"]
-        if wa_pred < wa_tgt - 0.05:
-            st.info(
-                f"**Water Absorption note:** Predicted WA ({wa_pred:.3f}%) "
-                f"is below the target ({wa_tgt:.3f}%). This is **intentional** - "
-                "the Bayesian objective penalises WA *over-achievement* only "
-                "(lower WA = lower porosity = better frost resistance, "
-                f"ISO 13006 Class {_WA_ISO_CLASS}). "
-                "The composition satisfies the water absorption specification."
-            )
 
 # ═══════════════════════════════════════════════════════════════════════════
 # TAB 4 — Compare All Methods
@@ -612,6 +623,32 @@ with tabs[3]:
                 "the **same composition**. See Tab 2 for explanation."
             )
 
+        # ── Feasibility warning (was previously only shown in Tab 3) ──────
+        # Without this check, a Bayesian result for which NO trial landed
+        # inside the training data's trust region — i.e. the "least-bad
+        # candidate only, do not trust as-is" fallback described in
+        # inverse_design.py — was silently placed in the comparison table
+        # next to two normal results, with nothing distinguishing it. That
+        # is how physically nonsensical rows (e.g. negative MOR/WA) could
+        # end up looking like a normal optimisation outcome.
+        bay_res = results.get("Bayesian Optimisation", {})
+        if not bay_res.get("feasible", True):
+            st.error(
+                "**Bayesian Optimisation result below is UNRELIABLE.** No "
+                "composition within the training data's trust region was "
+                f"found for this target after {bay_res.get('n_trials', '?')} "
+                "trials, so the row shown is only the least-bad candidate "
+                "found — do not use it as-is. Try relaxing the target "
+                "properties, increasing the trial count (Tab 3), or "
+                "expanding the training dataset to cover this region."
+            )
+        elif bay_res.get("n_feasible_trials") is not None:
+            st.caption(
+                f"Bayesian Optimisation: {bay_res['n_feasible_trials']}/"
+                f"{bay_res['n_trials']} trials landed inside the training "
+                "data's trust region; its row below was selected from those."
+            )
+
         # ── Comparison table ─────────────────────────────────────────────
         st.subheader("Recommended Compositions")
         cmp_df = pd.DataFrame({
@@ -622,6 +659,7 @@ with tabs[3]:
                    for k, v in res["predicted"].items()},
                 "Cost (Tk/kg)": res["cost_Tk_per_kg"],
                 "CO2 (kg/kg)": res["CO2_kg_per_kg"],
+                "Feasible": res.get("feasible", True),
             }
             for name, res in results.items()
         }).T
