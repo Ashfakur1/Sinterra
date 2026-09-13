@@ -19,7 +19,7 @@ METHODS
      Searches the continuous composition space to minimise normalised
      cost + normalised CO2 subject to meeting the target properties.
 
-ARCHITECTURE — PREDICTION vs. OPTIMISATION (IMPORTANT)
+ARCHITECTURE — PREDICTION vs. OPTIMISATION
 -------------------------------------------------------
 Two independent engines live in this framework:
 

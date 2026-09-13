@@ -33,7 +33,7 @@ CHANGE LOG (post peer-review)
   this question is answered empirically (on the SAME experimental-only
   nested LOO-CV as every other candidate) rather than asserted.
 
-DYNAMIC SAMPLE-SIZE REPORTING (this version)
+DYNAMIC SAMPLE-SIZE REPORTING
   Every place this script previously printed or plotted the synthetic /
   experimental sample counts used a literal number ("1000 synthetic",
   "~96% synthetic") that silently went stale whenever generate_dataset.py's
@@ -43,7 +43,7 @@ DYNAMIC SAMPLE-SIZE REPORTING (this version)
   in generate_dataset.py and re-running the pipeline updates this script's
   console output and plot text automatically — no manual edits needed here.
 
-KEY DECISIONS & JUSTIFICATIONS (retained from prior version, updated)
+KEY DECISIONS & JUSTIFICATIONS
   [A] Synthetic-only 5-fold CV is used ONLY for architecture selection
       (which model class fits the physics-informed generator best). This
       is a sanity check on the generator, not evidence of real-world skill.

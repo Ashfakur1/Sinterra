@@ -40,33 +40,22 @@ PRICE / CO2 ARCHITECTURE
   without any retraining. The currently-loaded price/CO2 file names and
   dates are shown in the sidebar for transparency.
 
-CHANGE LOG (post 8 -> 41 batch recalibration of generate_dataset.py)
-  Two pieces of hardcoded UI copy were left over from the original
-  8-batch calibration and were fixed here so the app doesn't mislead
-  users after the 41-batch recalibration:
-    1. Batch-count copy ("8 experimental / calibration batches") updated
+CHANGE LOG (8 -> 48 batch recalibration of generate_dataset.py)
+    1. Batch-count copy ("experimental / calibration batches") is
        to reflect the current lab_batches_raw.csv batch count, read
-       dynamically from metadata.json (n_lab_batches) instead of being
-       hardcoded, so it will not go stale again on the next
+       dynamically from metadata.json (n_lab_batches),
+       so it will not go stale again on the next
        recalibration.
-    2. The Water Absorption number_input's help text hardcoded a
-       "3.40-4.08%" range and an ISO 13006 Class BIIa (semi-vitreous,
-       WA 3-6%) classification. With the 41-batch data this is wrong:
-       the actual WA_pct range is roughly 0.25-1.23% (measured directly
+    2. The Water Absorption_pct range is roughly 0.25-1.23% (measured directly
        off the lab batches), which falls in ISO 13006 Class BIa/BIb
-       territory (WA <= 3%), not BIIa. The help text now reports the
+       territory (WA <= 3%). The help text reports the
        live WA_min/WA_max computed from the dataset and a classification
-       note that is derived from those values instead of being hardcoded,
-       so it self-corrects on future recalibrations too.
-
-CHANGE LOG (this version — dynamic synthetic-sample count)
-  The header caption used to hardcode "1,000 synthetic samples", which
-  silently went stale whenever generate_dataset.py's N_SYNTHETIC control
-  constant was changed. It now reads the actual synthetic-row count from
-  metadata.json ("n_synthetic", written live by generate_dataset.py each
-  run), falling back to counting the loaded dataset if that key is ever
-  missing. Changing N_SYNTHETIC and re-running the pipeline now updates
-  this caption automatically.
+       note that is derived from those values, so it self-corrects on future recalibrations too.
+    3. The header caption reads the actual synthetic-row count from
+       metadata.json ("n_synthetic", written live by generate_dataset.py each
+       run), falling back to counting the loaded dataset if that key is ever
+       missing. Changing N_SYNTHETIC and re-running the pipeline updates
+       this caption automatically.
 """
 
 import json

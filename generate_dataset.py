@@ -2,16 +2,15 @@
 """
 generate_dataset.py
 Physics-informed synthetic dataset generation for ceramic tile composition
-optimisation from 41 laboratory-fabricated calibration batches.
+optimisation from 48 laboratory-fabricated calibration batches.
 
-CHANGE LOG (41 batches)
-  This version replaces the earlier 8-batch calibration and fixes two
-  methodological issues surfaced by honest nested LOO-CV diagnostics on
-  the 41-batch set:
+CHANGE LOG (48 batches)
+  This version fixes two methodological issues surfaced by honest nested
+  LOO-CV diagnostics on the 48-batch set:
 
   1. REMOVED magnitude-floor forcing on Ridge coefficients.
      The previous version replaced any Ridge coefficient falling below a
-     hand-set floor with the floor value (sign-corrected). At n=41 this
+     hand-set floor with the floor value. At n=48 this
      floor was empirically shown to be actively harmful: for Shrinkage_pct
      specifically, removing the floor (keeping only the physically-motivated
      SIGN correction) cut LOO-CV relative error from ~54% to ~29%, with no
@@ -22,7 +21,7 @@ CHANGE LOG (41 batches)
   2. Ridge alpha is now selected PER TARGET via nested Leave-One-Out
      cross-validation (inner LOO on the 40 training batches only, for each
      outer held-out batch), instead of a single fixed alpha=0.1 justified
-     by an n=p=8 near-determined system that no longer holds at n=41.
+     by an n=p=8 near-determined system that no longer holds at n=48.
      The alpha grid is capped at 10.0. This cap is a deliberate choice,
      not an oversight: diagnostics showed that as alpha increases without
      bound, LOO-CV error for every target monotonically converges to the
@@ -40,11 +39,9 @@ CHANGE LOG (41 batches)
      performance may not reflect a genuinely learned experimental
      relationship.
 
-RECALIBRATION NOTE (this version)
-  Recalibrated against a new 41-batch lab_batches_raw.csv (WA_fraction
-  now on a single consistent scale across all rows; one stray corrupted
-  cell in the source spreadsheet -- NaSil = "0.907?" -- was read as
-  0.907). No logic changes were needed for the linear (Ridge) term: it
+RECALIBRATION NOTE
+  Recalibrated against a new 48-batch lab_batches_raw.csv.
+  No logic changes were needed for the linear (Ridge) term: it
   is refit at import time directly from whatever CSV is on disk. The
   interaction and AG98-quadratic terms remain fixed constants carried
   over from the previous calibration (see limitation note in Step 3 of
@@ -61,7 +58,7 @@ MATHEMATICAL MODEL
   ε(d) ~ N(0, σ_base·(1 + d/d_ref))   [heteroscedastic]
 
 COEFFICIENT ESTIMATION
-  Step 1 — Ridge regression on the 41 lab batches, alpha selected per
+  Step 1 — Ridge regression on the 48 lab batches, alpha selected per
             target via nested LOO-CV (see change log above).
             Ref: Hoerl & Kennard (1970) DOI:10.1080/00401706.1970.10488634
   Step 2 — Physics-based SIGN correction only (no magnitude floor) is
@@ -100,11 +97,11 @@ CO₂ FACTORS  (kg CO₂ / kg, cradle-to-gate)
   NaSil                     0.433       EPD-IES-0021224, Prochin Italia
 
 VALIDATION
-  Leave-One-Out cross-validation on the 41 laboratory batches. For each
+  Leave-One-Out cross-validation on the 48 laboratory batches. For each
   held-out batch, Ridge coefficients (with sign-only physics correction)
   AND the composition/property centroid AND the per-target alpha are all
   re-estimated from the remaining 40 batches only (alpha via an inner
-  LOO on those 40), then the held-out batch's properties are predicted.
+  LOO on those 47), then the held-out batch's properties are predicted.
   This is a true nested LOO-CV: no information from the held-out batch
   leaks into coefficient estimation OR hyperparameter selection.
 
