@@ -585,8 +585,7 @@ try:
     ax.legend(handles=[Patch(color="#E53935", label="Composition variable")],
               fontsize=_FS_LABEL, loc="lower right")
     ax.set_title(
-        f"Mean Feature Importance Across All Target Properties\n"
-        f"({best_name}; {_fit_src})",
+        "Mean Feature Importance Across All Target Properties",
         pad=14, fontsize=_FS_TITLE, fontweight="bold")
     ax.set_xlabel("Importance", fontsize=_FS_AX)
     ax.set_ylabel("", fontsize=_FS_AX)
