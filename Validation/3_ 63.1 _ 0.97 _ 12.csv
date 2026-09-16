@@ -1,0 +1,4 @@
+﻿,AG98,AG22,AG23,Soda F.,Potash F.,Crushing,ETP Clay,Na-Sil.,Firing MOR (MPa),Water Absorption (%),Fired Shrinkage (%),Cost (Tk/kg),CO2 (kg/kg),Feasible
+Non-Optimised (NN),18.8204,3.2444,14.5962,42.9865,15.2281,2.1005,2.4436,0.5803,63.328,0.99197,11.901,7.511,0.09519,true
+Cost + CO2 Optimised (NN),19.9741,3.2294,12.3897,40.974,17.9524,2.1002,2.6523,0.728,58.513,1.042,11.666,7.4606,0.09466,true
+Bayesian Optimisation,19.355,3.5816,13.6768,42.0833,15.5877,2.1024,3.0719,0.5411,62.814,0.97361,11.991,7.4448,0.09611,true
