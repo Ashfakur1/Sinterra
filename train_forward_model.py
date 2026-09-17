@@ -359,45 +359,27 @@ if HAS_SYNTHETIC:
         "RandomForest_native", "RandomForest_wrapped", "XGB", "LGBM", "CatBoost",
     }
     bounded_scores = {n: s for n, s in model_scores.items() if n in BOUNDED_ARCHITECTURES}
-    if bounded_scores:
-        production_name = max(bounded_scores, key=bounded_scores.get)
-        if production_name != best_name:
-            print(
-                f"PRODUCTION MODEL: using '{production_name}' (R² = "
-                f"{model_scores[production_name]:.4f}) instead of the "
-                f"top-scoring '{best_name}'. Reason: '{best_name}' is an "
-                "unbounded regressor whose synthetic self-consistency score "
-                "reflects recovering the (also-linear) synthetic generator, "
-                "not extrapolation safety. A bounded tree ensemble cannot "
-                "produce physically impossible predictions (e.g. negative "
-                "MOR/WA) anywhere in the composition search space, which is "
-                "what the Bayesian optimiser actually needs."
-            )
-        best_name = production_name
-    else:
+    if not bounded_scores:
         print(
             "WARNING: no tree-ensemble candidate was available/fitted "
-            f"successfully -- falling back to '{best_name}' as the "
-            "production model. This architecture is NOT guaranteed to keep "
-            "predictions within a physically plausible range outside the "
-            "densest part of the training data; the trust-region/sanity "
-            "guardrails and hard floor in inverse_design.py are the only "
-            "protection in that case. Install xgboost/lightgbm/catboost or "
-            "ensure RandomForest fits successfully to remove this warning."
+            "successfully. Install xgboost/lightgbm/catboost or ensure "
+            "RandomForest fits, otherwise the production model may be an "
+            "unbounded regressor and the guardrails in inverse_design.py "
+            "become the only protection against extrapolated predictions."
         )
 
-    final_model = Pipeline([("preproc", preproc), ("reg", candidate_models[best_name])])
-    final_model.fit(X_train, y_train)
-    y_pred = final_model.predict(X_test)
-
-    mae_combined = np.mean(np.abs(y_test - y_pred), axis=0)
-    r2_combined  = [r2_score(y_test[:, i], y_pred[:, i]) for i in range(3)]
-
-    print("\n[Legacy combined metric — synthetic + experimental together]")
-    print("CAUTION: majority synthetic; do NOT cite this as validation evidence")
-    print("(Reviewer 1, comment 2). See STEP B below for the real evidence.")
-    for t, m, r in zip(TARGET_COLS, mae_combined, r2_combined):
-        print(f"  {t:<25s}  MAE={m:.4f}  R²={r:.4f}")
+    # NOTE: STEP A no longer chooses the production model. It only ranks
+    # architectures by how well they recover the synthetic generator, which
+    # is a property of the generator, not of real ceramics. Selection moved
+    # to STEP B (experimental leave-one-out skill). `best_name` here is
+    # provisional and exists only so the legacy combined metric below can be
+    # computed for the same architecture the manuscript reports.
+    provisional_name = (max(bounded_scores, key=bounded_scores.get)
+                        if bounded_scores else best_name)
+    print(f"\nProvisional (synthetic-ranked) bounded architecture: "
+          f"{provisional_name}. Final selection is made in STEP B on "
+          "experimental leave-one-out skill.")
+    best_name = provisional_name
 
     lab_idx_set   = set(lab_idx)
     lab_mask_test = np.array([idx in lab_idx_set for idx in test_idx])
@@ -422,7 +404,63 @@ print(f"\n[STEP B] Experimental-only nested LOO-CV (n={n_exp} batches) — "
       "this is the evidence that matters for the manuscript's validation "
       "claims. Running for every candidate model architecture …")
 
-def run_experimental_loo(model_ctor, X_synth, y_synth, X_e, y_e):
+# ── Per-fold synthetic regeneration (leakage fix) ─────────────────────────────
+# THE PROBLEM THIS SOLVES
+#   The synthetic rows in dataset.csv come from a surrogate (Eq. 1) that was
+#   calibrated on ALL experimental batches. Holding batch i out of the
+#   training fold therefore does NOT remove batch i's influence: its
+#   composition and measured properties helped set the Ridge coefficients,
+#   the per-target lambda, the composition/property means, sigma_base and
+#   d_ref, all of which are baked into every synthetic row. Batch i leaks
+#   back into its own training fold through the synthetic data, and the
+#   resulting skill score is optimistic.
+#
+# THE FIX
+#   For fold i, rebuild the synthetic set from a surrogate calibrated on the
+#   OTHER 47 batches only (generate_dataset.build_synthetic_from_batches).
+#   Nothing derived from batch i then exists anywhere in the training fold.
+#   Folds are cached because the same 48 synthetic sets are reused by every
+#   candidate architecture.
+import generate_dataset as gd  # noqa: E402  (imported here, next to its use)
+
+_LAB_DF_FULL = gd.lab_df           # 48 rows, same order as the lab rows in X_exp
+_N_SYNTH_PER_FOLD = n_synth_total  # match the production synthetic set size
+_fold_synth_cache: dict = {}
+
+
+def _fold_synthetic(i: int):
+    """Synthetic (X, y) for fold i, from a surrogate that never saw batch i."""
+    if i not in _fold_synth_cache:
+        sub = _LAB_DF_FULL.drop(_LAB_DF_FULL.index[i])
+        syn = gd.build_synthetic_from_batches(
+            sub, _N_SYNTH_PER_FOLD, seed=1000 + i
+        )
+        _fold_synth_cache[i] = (
+            syn[feature_cols].reset_index(drop=True),
+            syn[TARGET_COLS].values,
+        )
+    return _fold_synth_cache[i]
+
+
+def run_experimental_loo(model_ctor, X_synth, y_synth, X_e, y_e,
+                          mode: str = "leakfree"):
+    """
+    Leave-one-out over the experimental batches.
+
+    mode:
+      "leakfree"  — fold i trains on [synthetic regenerated from the other 47
+                    batches] + [the other 47 batches]. This is the number to
+                    report: no information from the held-out batch reaches
+                    the model by any route.
+      "leaky"     — fold i trains on [the production synthetic set, calibrated
+                    on all 48] + [the other 47 batches]. Retained only so the
+                    manuscript can quantify how much the leak was worth.
+      "no_synth"  — fold i trains on [the other 47 batches] alone. This is the
+                    ablation that answers "does synthetic augmentation help at
+                    all?" — the question Reviewer 1 raised when noting that
+                    adding synthetic points cannot fix a small experimental
+                    set.
+    """
     n = len(X_e)
     preds         = np.zeros((n, len(TARGET_COLS)))
     errs          = np.zeros((n, len(TARGET_COLS)))
@@ -430,8 +468,18 @@ def run_experimental_loo(model_ctor, X_synth, y_synth, X_e, y_e):
     for i in range(n):
         train_exp_mask = np.ones(n, dtype=bool)
         train_exp_mask[i] = False
-        X_tr = pd.concat([X_synth, X_e.loc[train_exp_mask]], ignore_index=True)
-        y_tr = np.vstack([y_synth, y_e[train_exp_mask]])
+
+        if mode == "no_synth":
+            X_tr = X_e.loc[train_exp_mask].reset_index(drop=True)
+            y_tr = y_e[train_exp_mask]
+        else:
+            if mode == "leakfree":
+                Xs, ys = _fold_synthetic(i)
+            else:  # "leaky"
+                Xs, ys = X_synth, y_synth
+            X_tr = pd.concat([Xs, X_e.loc[train_exp_mask]], ignore_index=True)
+            y_tr = np.vstack([ys, y_e[train_exp_mask]])
+
         pipe = Pipeline([("preproc", preproc), ("reg", model_ctor())])
         pipe.fit(X_tr, y_tr)
         pred = pipe.predict(X_e.loc[[i]])[0]
@@ -448,20 +496,19 @@ def _make_ctor(m):
     # Factory avoids the classic late-binding closure bug in a loop.
     return lambda: clone(m)
 
-if HAS_SYNTHETIC:
-    model_ctors = {"LinearRegression": _make_ctor(candidate_models["LinearRegression"])}
-    if best_name != "LinearRegression":
-        model_ctors[best_name] = _make_ctor(candidate_models[best_name])
-else:
-    # No synthetic sanity check was possible in STEP A, so EVERY candidate
-    # is run through experimental-only nested LOO-CV here, and the best
-    # one (by mean skill score across targets) is selected as best_name.
-    model_ctors = {name: _make_ctor(model) for name, model in candidate_models.items()}
+# EVERY candidate is now run through the experimental-only LOO, not just
+# LinearRegression plus whichever architecture won the synthetic sanity
+# check. The manuscript states the forward model was "selected by a nested
+# leave-one-out cross validation restricted to the 48 experimental batches";
+# selecting on synthetic R² and only confirming two architectures on
+# experimental data did not match that sentence. It does now.
+model_ctors = {name: _make_ctor(model) for name, model in candidate_models.items()}
 
 exp_loo_results = {}
 for name, ctor in model_ctors.items():
     preds, errs, baseline_errs = run_experimental_loo(
-        ctor, X_synth_full.reset_index(drop=True), y_synth_full, X_exp, y_exp.values
+        ctor, X_synth_full.reset_index(drop=True), y_synth_full,
+        X_exp, y_exp.values, mode="leakfree"
     )
     exp_loo_results[name] = (preds, errs, baseline_errs)
     print(f"\n  Architecture: {name}")
@@ -477,54 +524,172 @@ for name, ctor in model_ctors.items():
               f"RMSE={rmse:.4f}  skill={skill:+.2f} ({flag})  "
               f"err/range={pct:.1f}%")
 
-if not HAS_SYNTHETIC:
-    def _avg_skill(name):
-        _, errs, baseline_errs = exp_loo_results[name]
-        skills = [1.0 - errs[:, i].mean() / baseline_errs[:, i].mean()
-                  for i in range(len(TARGET_COLS))]
-        return float(np.mean(skills))
+def _avg_skill(name):
+    _, errs, baseline_errs = exp_loo_results[name]
+    skills = [1.0 - errs[:, i].mean() / baseline_errs[:, i].mean()
+              for i in range(len(TARGET_COLS))]
+    return float(np.mean(skills))
 
-    best_name = max(exp_loo_results, key=_avg_skill)
 
-    # Same bounded-architecture preference as the HAS_SYNTHETIC branch above
-    # (see the long comment there) -- an unbounded regressor can still top
-    # a small-n experimental skill comparison by chance while remaining
-    # unsafe to query at arbitrary points in the composition box.
-    BOUNDED_ARCHITECTURES = {
-        "RandomForest_native", "RandomForest_wrapped", "XGB", "LGBM", "CatBoost",
-    }
-    bounded_names = [n for n in exp_loo_results if n in BOUNDED_ARCHITECTURES
-                      and _avg_skill(n) > 0.05]
-    if bounded_names:
-        production_name = max(bounded_names, key=_avg_skill)
-        if production_name != best_name:
-            print(
-                f"PRODUCTION MODEL: using '{production_name}' (mean skill = "
-                f"{_avg_skill(production_name):+.2f}) instead of the "
-                f"top-scoring '{best_name}' -- see the bounded-architecture "
-                "note in the HAS_SYNTHETIC branch above; the same reasoning "
-                "applies here."
-            )
-        best_name = production_name
+# ── Production architecture: chosen on EXPERIMENTAL skill, not synthetic R² ──
+top_name = max(exp_loo_results, key=_avg_skill)
 
-    print(f"\n[STEP A fallback — architecture chosen here, inside STEP B] "
-          f"Best architecture: {best_name}  (mean skill = {_avg_skill(best_name):+.2f}). "
-          "CAUTION: with N_SYNTHETIC=0 the same "
-          f"{n_exp} experimental batches were used both to CHOOSE this "
-          "architecture and to REPORT its performance below — treat these "
-          "skill scores as optimistic relative to the normal pipeline, "
-          "where architecture is chosen on an independent synthetic check.")
+# An unbounded regressor (LinearRegression, MLP) can still top a small-n
+# experimental skill comparison while remaining unsafe to query at arbitrary
+# points in the composition box, which is what the Bayesian optimiser does.
+# The bounded-architecture preference is therefore retained, but it now
+# operates on experimental skill rather than on synthetic self-consistency.
+BOUNDED_ARCHITECTURES = {
+    "RandomForest_native", "RandomForest_wrapped", "XGB", "LGBM", "CatBoost",
+}
+bounded_names = [n for n in exp_loo_results
+                 if n in BOUNDED_ARCHITECTURES and _avg_skill(n) > 0.05]
 
-    # Fit the production model on ALL experimental batches — there is no
-    # synthetic hold-out to reserve any of them for a separate test set.
-    final_model = Pipeline([("preproc", preproc), ("reg", candidate_models[best_name])])
+# OPTIONAL PIN. Set to an architecture name (e.g. "LGBM") to force it as the
+# production model; leave as None to let experimental skill decide.
+#   Why this exists: the manuscript names LightGBM as the forward model. Once
+#   selection is done honestly on experimental leave-one-out skill, a
+#   different architecture may win — the margin between the tree ensembles is
+#   small and well within what 48 batches can resolve. Pinning is legitimate
+#   (they are near-equivalent, and consistency with a submitted manuscript has
+#   value), but it must be disclosed rather than hidden, so pinning a model
+#   that is not the top scorer prints a warning and records the gap. Do not
+#   pin silently and report the pinned model as "selected by cross validation".
+PRODUCTION_ARCHITECTURE_PIN = None
+
+if PRODUCTION_ARCHITECTURE_PIN and PRODUCTION_ARCHITECTURE_PIN in exp_loo_results:
+    best_name = PRODUCTION_ARCHITECTURE_PIN
+    _free_choice = max(bounded_names, key=_avg_skill) if bounded_names else best_name
+    if _free_choice != best_name:
+        print(
+            f"\nDISCLOSURE: production architecture is PINNED to "
+            f"'{best_name}' (mean experimental skill {_avg_skill(best_name):+.3f}). "
+            f"Unpinned selection would have chosen '{_free_choice}' "
+            f"({_avg_skill(_free_choice):+.3f}). The manuscript must not "
+            "describe the pinned model as the one cross validation selected; "
+            "say it was chosen among near-equivalent tree ensembles and give "
+            "both skill scores."
+        )
+elif bounded_names:
+    best_name = max(bounded_names, key=_avg_skill)
+    if best_name != top_name:
+        print(
+            f"\nPRODUCTION MODEL: using '{best_name}' (mean experimental "
+            f"skill = {_avg_skill(best_name):+.2f}) instead of the "
+            f"top-scoring '{top_name}' ({_avg_skill(top_name):+.2f}). "
+            "Reason: the top scorer is an unbounded regressor, which can "
+            "emit physically impossible values anywhere in the composition "
+            "search space; a tree ensemble cannot."
+        )
+else:
+    best_name = top_name
+    print(f"\nWARNING: no bounded architecture cleared skill > 0.05. Falling "
+          f"back to '{best_name}'. The guardrails in inverse_design.py are "
+          "then the only protection against extrapolated predictions.")
+
+print(f"\n[STEP B] Architecture selected on experimental LOO skill: "
+      f"{best_name}  (mean skill = {_avg_skill(best_name):+.2f})")
+
+# Refit the production model now that best_name is known from experimental
+# evidence rather than from the synthetic sanity check.
+final_model = Pipeline([("preproc", preproc), ("reg", candidate_models[best_name])])
+if HAS_SYNTHETIC:
+    final_model.fit(X_train, y_train)
+    y_pred = final_model.predict(X_test)
+    mae_combined = np.mean(np.abs(y_test - y_pred), axis=0)
+    r2_combined  = [r2_score(y_test[:, i], y_pred[:, i]) for i in range(3)]
+
+    print("\n[Legacy combined metric — synthetic + experimental together]")
+    print("CAUTION: majority synthetic; do NOT cite this as validation "
+          "evidence (Reviewer 1, comment 2).")
+    for t, m, r in zip(TARGET_COLS, mae_combined, r2_combined):
+        print(f"  {t:<25s}  MAE={m:.4f}  R²={r:.4f}")
+else:
     final_model.fit(X_exp, y_exp.values)
 
-print("\n[STEP B SUMMARY] Report the experimental-only nested LOO-CV numbers "
-      "above in the manuscript, NOT the combined-test-set R² from STEP A. "
-      "A model without skill > 0.05 here should not be described as having "
-      "learned a real composition-property relationship, regardless of "
-      "what the combined-test-set R² shows.")
+# ══════════════════════════════════════════════════════════════════════════
+# STEP C: How much was the leak worth, and does synthetic data help at all?
+# ══════════════════════════════════════════════════════════════════════════
+# Two comparisons a reviewer will ask for, both run on the production
+# architecture and on the linear baseline:
+#   leaky     vs leakfree  -> how optimistic were the previously reported
+#                             skill scores, given the surrogate had seen
+#                             every batch it was later tested against
+#   leakfree  vs no_synth  -> does synthetic augmentation earn its place?
+#                             If no_synth matches or beats leakfree, the
+#                             surrogate step adds nothing and the paper
+#                             should say so plainly.
+ABLATION_MODELS = [n for n in ("LinearRegression", best_name)
+                   if n in candidate_models]
+ablation_rows = []
+if HAS_SYNTHETIC:
+    print("\n[STEP C] Leakage and synthetic-augmentation ablation "
+          f"(n={n_exp} experimental batches) …")
+    for name in ABLATION_MODELS:
+        ctor = _make_ctor(candidate_models[name])
+        for mode in ("leaky", "leakfree", "no_synth"):
+            if mode == "leakfree":
+                _, errs, base = exp_loo_results[name]
+            else:
+                _, errs, base = run_experimental_loo(
+                    ctor, X_synth_full.reset_index(drop=True), y_synth_full,
+                    X_exp, y_exp.values, mode=mode
+                )
+            print(f"\n  {name}  [{mode}]")
+            for i, t in enumerate(TARGET_COLS):
+                mae   = errs[:, i].mean()
+                skill = 1.0 - mae / base[:, i].mean()
+                ablation_rows.append({
+                    "model": name, "mode": mode, "target": t,
+                    "mae": float(mae),
+                    "rmse": float(np.sqrt((errs[:, i] ** 2).mean())),
+                    "skill": float(skill),
+                })
+                print(f"    {t:<15s} MAE={mae:.4f}  skill={skill:+.2f}")
+
+    abl = pd.DataFrame(ablation_rows)
+    abl.to_csv(DATADIR / "leakage_and_augmentation_ablation.csv", index=False)
+    print("\nSaved: data/leakage_and_augmentation_ablation.csv")
+    print("REPORT THIS IN THE MANUSCRIPT. 'leakfree' is the honest number; "
+          "'leaky' is what the previous pipeline reported; 'no_synth' says "
+          "whether the surrogate step was worth including at all.")
+
+# ── Is the non-linear model actually better? Paired test, not an assertion ───
+# The manuscript says LGBM and LinearRegression are "statistically
+# indistinguishable" for WA. No test was ever run to support the word
+# "statistically" — equal MAE to 3 decimals is not a test. A Wilcoxon
+# signed-rank test on the 48 paired fold-wise absolute errors is, and it
+# also tells us whether the MOR/shrinkage advantages are real or noise.
+if "LinearRegression" in exp_loo_results and best_name != "LinearRegression":
+    from scipy.stats import wilcoxon
+    _, lin_errs, _ = exp_loo_results["LinearRegression"]
+    _, bst_errs, _ = exp_loo_results[best_name]
+    print(f"\n[Paired Wilcoxon signed-rank: {best_name} vs LinearRegression, "
+          f"fold-wise absolute errors, n={n_exp}]")
+    wilcox_rows = []
+    for i, t in enumerate(TARGET_COLS):
+        d = lin_errs[:, i] - bst_errs[:, i]
+        if np.allclose(d, 0):
+            stat, p = float("nan"), 1.0
+        else:
+            stat, p = wilcoxon(lin_errs[:, i], bst_errs[:, i])
+        rel = (1 - bst_errs[:, i].mean() / lin_errs[:, i].mean()) * 100
+        verdict = ("significant" if p < 0.05 else
+                   "NOT significant — describe as indistinguishable")
+        wilcox_rows.append({"target": t, "mae_linear": float(lin_errs[:, i].mean()),
+                            f"mae_{best_name}": float(bst_errs[:, i].mean()),
+                            "mae_reduction_pct": float(rel),
+                            "wilcoxon_p": float(p), "verdict": verdict})
+        print(f"  {t:<15s} MAE reduction = {rel:+.1f}%   p = {p:.4f}   {verdict}")
+    pd.DataFrame(wilcox_rows).to_csv(
+        DATADIR / "linear_vs_nonlinear_wilcoxon.csv", index=False)
+    print("Saved: data/linear_vs_nonlinear_wilcoxon.csv")
+
+print("\n[STEP B SUMMARY] Report the experimental-only LEAKAGE-FREE LOO-CV "
+      "numbers above in the manuscript, NOT the combined-test-set R² from "
+      "STEP A. A model without skill > 0.05 here should not be described as "
+      "having learned a real composition-property relationship, regardless "
+      "of what the combined-test-set R² shows.")
 
 # Defined once here (not inside the feature-importance try/except below) so
 # it's guaranteed to exist for the PDP section even if that block errors out.
@@ -686,7 +851,25 @@ _FS_PDP_LABEL    = 20
 _FS_PDP_TICK     = 18
 colors = ["#1565C0", "#D32F2F", "#388E3C"]
 
-for t_idx, tname in enumerate(TARGET_COLS):
+# PDPs are produced over TWO reference sets:
+#   "synthetic"    — marginalised over the synthetic training set (the
+#                    original behaviour, kept for continuity)
+#   "experimental" — marginalised over the 48 real batches
+# The distinction matters for the manuscript's argument. Section 3.2 uses
+# step-like, non-monotonic partial dependence as evidence that a non-linear
+# model is warranted. But the synthetic set was generated by a LINEAR Ridge
+# surrogate, so a tree ensemble fitted to it will produce axis-aligned steps
+# whether or not real ceramics behave that way — the steps are partly an
+# artefact of the generator plus the learner. Marginalising over the real
+# compositions instead removes that circularity. If the non-monotonicity
+# survives on the experimental reference set, the argument stands; if it
+# only appears on the synthetic one, the claim should be dropped and the
+# case rested on the Wilcoxon result from STEP C instead.
+_PDP_REFERENCE_SETS = [("synthetic", X_train)] if HAS_SYNTHETIC else []
+_PDP_REFERENCE_SETS.append(("experimental", X_exp))
+
+for _pdp_tag, _pdp_X in _PDP_REFERENCE_SETS:
+  for t_idx, tname in enumerate(TARGET_COLS):
     n_comp = len(comp_cols)
     ncols  = 4
     nrows  = math.ceil(n_comp / ncols)
@@ -694,7 +877,7 @@ for t_idx, tname in enumerate(TARGET_COLS):
     axes = axes.flatten()
     for ax_idx, feat in enumerate(comp_cols):
         ax = axes[ax_idx]
-        grid, means = compute_pdp(final_model, X_train, feat)
+        grid, means = compute_pdp(final_model, _pdp_X, feat)
         ax.plot(grid, means[:, t_idx], color=colors[t_idx], linewidth=3.5)
         short = MAT_SHORT.get(feat, feat.replace("_wtpct", ""))
         ax.set_xlabel(f"{short} (wt%)", fontsize=_FS_PDP_LABEL, labelpad=10)
@@ -707,15 +890,17 @@ for t_idx, tname in enumerate(TARGET_COLS):
         plt.setp(ax.get_xticklabels(), rotation=25, ha="right")
     for ax in axes[n_comp:]:
         ax.set_visible(False)
+    _ref_label = ("synthetic training set" if _pdp_tag == "synthetic"
+                  else f"{n_exp} experimental batches")
     fig.suptitle(
         f"Partial Dependence of {TGT_LABELS[tname]}\non Composition Variables (wt%)\n"
-        f"(marginalised over training set, n = {len(X_train)}; "
-        f"{_fit_src})",
+        f"(marginalised over {_ref_label}, n = {len(_pdp_X)}; {_fit_src})",
         fontsize=_FS_PDP_SUPTITLE, fontweight="bold", y=0.86
     )
     plt.tight_layout(rect=[0, 0, 1, 0.82])
-    savefig(fig, f"PDP_{tname}")
-    print(f"  Saved: PDP_{tname}.pdf / .png")
+    _stem = f"PDP_{tname}" if _pdp_tag == "synthetic" else f"PDP_{tname}_experimental"
+    savefig(fig, _stem)
+    print(f"  Saved: {_stem}.pdf / .png")
 
 # ── Save model ────────────────────────────────────────────────────────────────
 joblib.dump(final_model, MODELDIR / "forward_model.joblib")

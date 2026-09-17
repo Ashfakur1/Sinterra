@@ -182,6 +182,27 @@ SIGN = {"AG98": (+1, +1, -1), "AG22": (+1, +1, -1), "AG23": (+1, +1, -1),
 
 ALPHA_GRID = [0.01, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0]
 
+# ── Noise-model constants (Eq. 1: ε(d) ~ N(0, σ_base·(1 + d/d_ref))) ─────────
+# Previously these lived as magic numbers inline. They are named here, and
+# written out to metadata.json by save(), because the manuscript's Eq. (1)
+# defines σ_base and d_ref but Appendix A never reported their values — a
+# reader could not reproduce the synthetic set from the paper alone.
+#   σ_base is set per target as SIGMA_BASE_FRAC of that target's observed
+#   laboratory range; d_ref is the MEDIAN pairwise distance between
+#   calibration batches in bound-normalised composition space.
+SIGMA_BASE_FRAC = 0.04
+
+# d in Eq. (1) is computed as the mean distance to the _DIST_K nearest
+# calibration batches, not to the single nearest one. With _DIST_K = 1 the
+# distance field is jagged (it jumps as the nearest-neighbour identity
+# switches); averaging over the 3 nearest gives a smoother, more stable
+# uncertainty ramp. NOTE FOR THE MANUSCRIPT: Section 2.2 currently describes
+# d as "the normalised distance from the nearest calibration batch", which
+# matches _DIST_K = 1, not the code. Either set _DIST_K = 1 or correct the
+# sentence to "the mean normalised distance to the three nearest
+# calibration batches" — the two must agree.
+_DIST_K = 3
+
 
 # ── Ridge regression helpers ─────────────────────────────────────────────────
 def _fit_ridge_one_target(src: pd.DataFrame, alpha: float, target: str) -> np.ndarray:
@@ -248,54 +269,88 @@ logger.info("Production Ridge alphas selected via nested LOO-CV: %s",
             PHYSICS_ALPHAS)
 
 _RANGE     = np.array([BOUNDS[m][1] - BOUNDS[m][0] for m in MATS])
-_LAB_XNORM = lab_df[MATS].values / _RANGE
-_D_REF     = float(np.median([
-    np.linalg.norm(_LAB_XNORM[i] - _LAB_XNORM[j])
-    for i in range(len(_LAB_RAW)) for j in range(i + 1, len(_LAB_RAW))
-]))
 
 
-def _dist(comp: np.ndarray, k: int = 3) -> float:
-    d = np.linalg.norm(_LAB_XNORM - comp / _RANGE, axis=1)
+def _xnorm_of(src: pd.DataFrame) -> np.ndarray:
+    return src[MATS].values / _RANGE
+
+
+def _d_ref_of(xnorm: np.ndarray) -> float:
+    """Median pairwise distance between calibration batches (Eq. 1, d_ref)."""
+    n = len(xnorm)
+    return float(np.median([
+        np.linalg.norm(xnorm[i] - xnorm[j])
+        for i in range(n) for j in range(i + 1, n)
+    ]))
+
+
+_LAB_XNORM = _xnorm_of(lab_df)
+_D_REF     = _d_ref_of(_LAB_XNORM)
+
+
+def _dist_against(comp: np.ndarray, xnorm: np.ndarray, k: int = _DIST_K) -> float:
+    d = np.linalg.norm(xnorm - comp / _RANGE, axis=1)
     return float(np.sort(d)[:k].mean())
 
 
-def _physics_pred(cd: dict) -> dict:
-    p = {t: LAB_MEAN_PROPS[t] for t in TGTS}
+def _dist(comp: np.ndarray, k: int = _DIST_K) -> float:
+    return _dist_against(comp, _LAB_XNORM, k)
 
-    for m, (cs, cw, cm) in PHYSICS_COEFF.items():
-        d = cd[m] - LAB_MEAN_COMP[m]
+
+def _physics_pred_with(cd: dict, coeffs: dict, mean_comp: dict,
+                        mean_props: dict) -> dict:
+    """
+    Evaluate Eq. (1) using an ARBITRARY calibration (coefficients + means).
+
+    Parameterising this — rather than reading the module-level production
+    fit — is what lets a caller rebuild the surrogate from a SUBSET of the
+    laboratory batches. That is required for a leakage-free leave-one-out
+    evaluation of the forward model: if the surrogate is calibrated on all
+    48 batches, the synthetic rows derived from it carry information about
+    the held-out batch, and that information re-enters the training fold
+    through the synthetic data even though the batch itself was removed.
+    See build_synthetic_from_batches() below.
+    """
+    p = {t: mean_props[t] for t in TGTS}
+
+    for m, (cs, cw, cm) in coeffs.items():
+        d = cd[m] - mean_comp[m]
         p["Shrinkage_pct"] += cs * d
         p["WA_pct"]        += cw * d
         p["MOR_MPa"]       += cm * d
 
     total_clay = cd["AG98"] + cd["AG22"] + cd["AG23"]
     total_fsp  = cd["SodaF"] + cd["PotashF"]
-    clay_mean  = (LAB_MEAN_COMP["AG98"] + LAB_MEAN_COMP["AG22"]
-                  + LAB_MEAN_COMP["AG23"])
-    fsp_mean   = LAB_MEAN_COMP["SodaF"] + LAB_MEAN_COMP["PotashF"]
+    clay_mean  = (mean_comp["AG98"] + mean_comp["AG22"] + mean_comp["AG23"])
+    fsp_mean   = mean_comp["SodaF"] + mean_comp["PotashF"]
     interaction = (total_clay - clay_mean) * (total_fsp - fsp_mean)
     for t in TGTS:
         p[t] += INTERACTION_COEFF[t] * interaction
 
-    d_ag98 = cd["AG98"] - LAB_MEAN_COMP["AG98"]
+    d_ag98 = cd["AG98"] - mean_comp["AG98"]
     for t in TGTS:
         p[t] += AG98_QUAD_COEFF[t] * (d_ag98 ** 2)
 
     return p
 
 
-def _sample_comps(n: int) -> np.ndarray:
+def _physics_pred(cd: dict) -> dict:
+    """Production surrogate — Eq. (1) at the full 48-batch calibration."""
+    return _physics_pred_with(cd, PHYSICS_COEFF, LAB_MEAN_COMP, LAB_MEAN_PROPS)
+
+
+def _sample_comps(n: int, sampler: np.random.Generator = None) -> np.ndarray:
     """Rejection-sample on the simplex. Returns (n, 8) array; (0, 8) when n==0."""
     if n <= 0:
         return np.zeros((0, len(MATS)))
+    sampler = sampler if sampler is not None else rng
     free   = ["AG98", "AG22", "AG23", "PotashF", "Crushing", "ETP", "NaSil"]
     lo     = np.array([BOUNDS[k][0] for k in free])
     hi     = np.array([BOUNDS[k][1] for k in free])
     lo_s, hi_s = BOUNDS["SodaF"]
     out = []
     while len(out) < n:
-        v = rng.uniform(lo, hi)
+        v = sampler.uniform(lo, hi)
         s = 100.0 - v.sum()
         if lo_s <= s <= hi_s:
             c = dict(zip(free, v)); c["SodaF"] = s
@@ -303,28 +358,67 @@ def _sample_comps(n: int) -> np.ndarray:
     return np.array(out)
 
 
+def build_synthetic_from_batches(lab_subset: pd.DataFrame,
+                                  n_synthetic: int,
+                                  seed: int = 42) -> pd.DataFrame:
+    """
+    Generate `n_synthetic` synthetic rows from a surrogate calibrated ONLY on
+    `lab_subset`.
+
+    This is the public entry point used by train_forward_model.py's
+    leakage-free leave-one-out evaluation. Every quantity Eq. (1) depends on
+    — Ridge coefficients, per-target λ, composition means, property means,
+    σ_base, d_ref, and the distance field — is recomputed from `lab_subset`
+    alone, so a batch excluded from `lab_subset` leaves no trace in the
+    returned rows.
+
+    Passing the full 48-batch frame reproduces the production dataset (up to
+    the RNG seed), so this function is also what build_dataset() calls.
+    """
+    sub_rng = np.random.default_rng(seed)
+
+    alphas = {t: _select_alpha_nested(lab_subset, t) for t in TGTS}
+    coeffs, _ = _fit_ridge_coefficients(lab_subset=lab_subset, alphas=alphas)
+    mean_comp  = {m: float(lab_subset[m].mean()) for m in MATS}
+    mean_props = {t: float(lab_subset[t].mean()) for t in TGTS}
+
+    xnorm = _xnorm_of(lab_subset)
+    d_ref = _d_ref_of(xnorm)
+
+    noise_base = {t: (lab_subset[t].max() - lab_subset[t].min()) * SIGMA_BASE_FRAC
+                  for t in TGTS}
+    clip_lo    = {t: lab_subset[t].min()        for t in TGTS}
+    clip_hi    = {t: lab_subset[t].max() * 1.10 for t in TGTS}
+
+    rows = []
+    for comp in _sample_comps(n_synthetic, sampler=sub_rng):
+        cd  = dict(zip(MATS, comp))
+        yp  = _physics_pred_with(cd, coeffs, mean_comp, mean_props)
+        d   = _dist_against(comp, xnorm)
+        row = {f"{m}_wtpct": cd[m] for m in MATS}
+        for t in TGTS:
+            row[t] = float(np.clip(
+                yp[t] + sub_rng.normal(0, noise_base[t] * (1 + d / d_ref)),
+                clip_lo[t], clip_hi[t]
+            ))
+        row["cost_Tk_per_kg"] = sum(cd[m] / 100 * COST[m]    for m in MATS)
+        row["CO2_kg_per_kg"]  = sum(cd[m] / 100 * CO2_MID[m] for m in MATS)
+        row["source"] = "synthetic"
+        row.update(PROC)
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
 def build_dataset(n_synthetic: int = N_SYNTHETIC) -> pd.DataFrame:
-    noise_base = {t: (lab_df[t].max() - lab_df[t].min()) * 0.04 for t in TGTS}
-    clip_lo    = {t: lab_df[t].min()           for t in TGTS}
-    clip_hi    = {t: lab_df[t].max() * 1.10    for t in TGTS}
     rows = []
 
     if n_synthetic > 0:
-        for comp in _sample_comps(n_synthetic):
-            cd  = dict(zip(MATS, comp))
-            yp  = _physics_pred(cd)
-            d   = _dist(comp)
-            row = {f"{m}_wtpct": cd[m] for m in MATS}
-            for t in TGTS:
-                row[t] = float(np.clip(
-                    yp[t] + rng.normal(0, noise_base[t] * (1 + d / _D_REF)),
-                    clip_lo[t], clip_hi[t]
-                ))
-            row["cost_Tk_per_kg"] = sum(cd[m] / 100 * COST[m]    for m in MATS)
-            row["CO2_kg_per_kg"]  = sum(cd[m] / 100 * CO2_MID[m] for m in MATS)
-            row["source"] = "synthetic"
-            row.update(PROC)
-            rows.append(row)
+        # Production path: surrogate calibrated on ALL laboratory batches.
+        rows.extend(
+            build_synthetic_from_batches(lab_df, n_synthetic)
+            .to_dict("records")
+        )
 
     for b in _LAB_RAW:
         cd  = {m: b[m] for m in MATS}
@@ -412,6 +506,66 @@ def validate_physics(df: pd.DataFrame) -> bool:
     return all_pass
 
 
+# ── Sensitivity of the LITERATURE-FIXED γ and δ constants ────────────────────
+def sensitivity_fixed_coefficients(scales=(0.5, 1.0, 1.5)) -> dict:
+    """
+    Re-run the surrogate's leave-one-out fidelity check with the interaction
+    coefficient γ and the AG98 quadratic coefficient δ scaled up and down.
+
+    WHY THIS EXISTS: γ and δ are the only two terms in Eq. (1) that are NOT
+    fitted on this dataset — Section 2.2 states they are "fixed from an
+    independent literature calibration". A reviewer is entitled to ask what
+    the surrogate would look like if those imported constants were wrong.
+    Reporting how much leave-one-out skill moves when they are scaled by
+    ±50% converts an unfalsifiable citation into a bounded claim: if skill
+    barely moves, the exact values do not matter much and the paper can say
+    so; if it moves a lot, the constants need their own justification.
+    """
+    global INTERACTION_COEFF, AG98_QUAD_COEFF
+    base_gamma, base_delta = dict(INTERACTION_COEFF), dict(AG98_QUAD_COEFF)
+    out: dict = {}
+    try:
+        for s in scales:
+            INTERACTION_COEFF = {k: v * s for k, v in base_gamma.items()}
+            AG98_QUAD_COEFF   = {k: v * s for k, v in base_delta.items()}
+            skills = _loo_skill_scores()
+            out[f"scale_{s:g}x"] = skills
+            logger.info(
+                "  γ,δ × %.1f  →  skill  MOR=%+.2f  WA=%+.2f  Shrinkage=%+.2f",
+                s, skills["MOR_MPa"], skills["WA_pct"], skills["Shrinkage_pct"]
+            )
+    finally:
+        INTERACTION_COEFF, AG98_QUAD_COEFF = base_gamma, base_delta
+    return out
+
+
+def _loo_skill_scores() -> dict:
+    """Leave-one-out skill score per target, using the CURRENT γ/δ globals."""
+    loo_errors      = {t: [] for t in TGTS}
+    baseline_errors = {t: [] for t in TGTS}
+
+    for i in range(len(_LAB_RAW)):
+        train_df = pd.DataFrame([b for j, b in enumerate(_LAB_RAW) if j != i])
+        test     = _LAB_RAW[i]
+
+        mean_comp  = {m: float(train_df[m].mean()) for m in MATS}
+        mean_props = {t: float(train_df[t].mean()) for t in TGTS}
+        fold_alphas = {t: _select_alpha_nested(train_df, t) for t in TGTS}
+        fold_coeff, _ = _fit_ridge_coefficients(lab_subset=train_df,
+                                                 alphas=fold_alphas)
+
+        pred = _physics_pred_with({m: test[m] for m in MATS},
+                                   fold_coeff, mean_comp, mean_props)
+        for t in TGTS:
+            loo_errors[t].append(abs(pred[t] - test[t]))
+            baseline_errors[t].append(abs(mean_props[t] - test[t]))
+
+    return {
+        t: float(1.0 - np.mean(loo_errors[t]) / np.mean(baseline_errors[t]))
+        for t in TGTS
+    }
+
+
 # ── Save outputs ─────────────────────────────────────────────────────────────
 def save(df: pd.DataFrame) -> None:
     OUTDIR.mkdir(parents=True, exist_ok=True)
@@ -456,7 +610,23 @@ def save(df: pd.DataFrame) -> None:
             "-- flagged as a limitation pending nested-CV validation of "
             "their marginal contribution on THIS dataset."
         ),
-        "noise_model": "heteroscedastic — σ(d) = σ_base·(1 + d/d_ref); σ_base = 4% of observed range",
+        "noise_model": (
+            f"heteroscedastic — σ(d) = σ_base·(1 + d/d_ref); "
+            f"σ_base = {SIGMA_BASE_FRAC:.0%} of each target's observed "
+            "laboratory range; d = mean bound-normalised distance to the "
+            f"{_DIST_K} nearest calibration batches; d_ref = median pairwise "
+            "bound-normalised distance between calibration batches."
+        ),
+        # Numeric values of every Eq. (1) constant that Appendix A previously
+        # left unreported. Without these the synthetic set is not
+        # reproducible from the manuscript alone.
+        "noise_sigma_base_frac": SIGMA_BASE_FRAC,
+        "noise_sigma_base_per_target": {
+            t: float((lab_df[t].max() - lab_df[t].min()) * SIGMA_BASE_FRAC)
+            for t in TGTS
+        },
+        "noise_d_ref": _D_REF,
+        "noise_distance_k_nearest": _DIST_K,
         "validation_method": (
             f"Nested Leave-One-Out cross-validation on {len(_LAB_RAW)} "
             "laboratory batches (Ridge coefficients AND alpha refit per "
@@ -724,6 +894,10 @@ def main() -> None:
     logger.info("[2/4] Surrogate fidelity — nested LOO-CV on %d laboratory batches …",
                 len(_LAB_RAW))
     validate_physics(df)
+
+    logger.info("Sensitivity of the literature-fixed γ and δ constants "
+                "(Eq. 1) — report this in Appendix A:")
+    sensitivity_fixed_coefficients()
 
     logger.info("[3/4] Saving outputs …")
     save(df)

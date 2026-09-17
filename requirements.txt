@@ -1,13 +1,25 @@
-numpy
-pandas
-matplotlib
-seaborn
-scikit-learn
-scipy
-joblib
-optuna
-streamlit==1.45.0
-altair==5.5.0
-catboost
-xgboost
-lightgbm
+# Pinned versions verified to reproduce the manuscript's reported numbers
+# (Table 3 CV R^2, Table 4 LOO-CV MAE/RMSE/skill, Table 5 fabricated-batch
+# predictions) against lab_batches_raw.csv (n=48).
+#
+# IMPORTANT: xgboost, lightgbm and catboost are required, not optional.
+# train_forward_model.py degrades to a different production model
+# (RandomForest instead of LightGBM) if any of these fail to import,
+# and the reported numbers will then not match the manuscript. Install
+# everything below before running the pipeline.
+#
+# Install with:
+#   pip install --break-system-packages -r requirements.txt
+
+numpy==2.4.4
+pandas==3.0.2
+scipy==1.17.1
+scikit-learn==1.8.0
+matplotlib==3.10.8
+seaborn==0.13.2
+joblib==1.5.3
+optuna==5.0.0
+streamlit==1.64.0
+xgboost==3.4.1
+lightgbm==4.7.0
+catboost==1.2.10

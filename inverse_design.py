@@ -488,6 +488,47 @@ def _composition_extrapolation_score(comp: dict[str, float]) -> float:
     return float(d[0][0])
 
 
+PROPERTY_PENALTY_WEIGHT = 5.0
+
+
+def _asymmetric_property_penalty(MOR_p: float, WA_p: float, SH_p: float,
+                                  MOR_t: float, WA_t: float, SH_t: float) -> float:
+    """
+    Eq. (3) of the manuscript — the ASYMMETRIC property-matching penalty.
+
+        P = max(0, MOR* - MOR_hat)/r_MOR · w
+          + max(0, WA_hat - WA*)/r_WA   · w
+          + |S_hat - S*|/r_S            · w
+
+    This function did not previously exist. The optimiser used a symmetric
+    |predicted - target| term for all three properties, and streamlit_app.py
+    told users so explicitly ("MOR, WA, and Shrinkage are all penalised
+    symmetrically"). The manuscript, meanwhile, describes the penalty as
+    asymmetric by design and then *interprets validation results through
+    that asymmetry* — Section 3.3 explains the Bayesian batches' predicted
+    WA sitting at or below target as "consistent with the one sided WA
+    penalty in Eq. (3)". With a symmetric penalty in the code, that
+    explanation had nothing behind it; the agreement was coincidental.
+
+    The asymmetry is the engineering content of the objective:
+      MOR is a MINIMUM specification  -> only under-achievement is penalised;
+                                         exceeding the target is free.
+      WA  is a MAXIMUM specification  -> only over-achievement is penalised;
+                                         a denser body than asked for is free.
+      Shrinkage is a DIMENSIONAL      -> both directions are penalised, since
+      specification                      tiles must hit a size, not beat it.
+
+    Restoring it changes what the optimiser returns: it can now spend its
+    cost/CO2 budget on compositions that overshoot MOR or undershoot WA
+    rather than being pulled back toward the target from both sides.
+    """
+    return (
+        max(0.0, MOR_t - MOR_p) / _prop_ranges["MOR_MPa"] * PROPERTY_PENALTY_WEIGHT
+        + max(0.0, WA_p - WA_t) / _prop_ranges["WA_pct"] * PROPERTY_PENALTY_WEIGHT
+        + abs(SH_p - SH_t) / _prop_ranges["Shrinkage_pct"] * PROPERTY_PENALTY_WEIGHT
+    )
+
+
 def _property_sanity_penalty(MOR_p: float, WA_p: float, SH_p: float) -> float:
     """
     How far predicted properties fall outside the observed training
@@ -597,12 +638,12 @@ def inverse_bayesian_optimization(
         norm_cost = (cost - _cost_min) / _cost_range
         norm_co2 = (co2 - _co2_min) / _co2_range
 
-        penalty = (
-            abs(MOR_p - MOR_MPa_tgt) / _prop_ranges["MOR_MPa"] * 5.0
-            + abs(WA_p - WA_tgt) / _prop_ranges["WA_pct"] * 5.0
-            + abs(SH_p - Shrink_tgt) / _prop_ranges["Shrinkage_pct"] * 5.0
-            + soda_pen
-        )
+        # Eq. (3): asymmetric in MOR (minimum spec) and WA (maximum spec),
+        # symmetric in shrinkage (dimensional spec). Previously all three
+        # terms were symmetric — see _asymmetric_property_penalty().
+        penalty = _asymmetric_property_penalty(
+            MOR_p, WA_p, SH_p, MOR_MPa_tgt, WA_tgt, Shrink_tgt
+        ) + soda_pen
 
         # ── Trust-region + sanity guardrails (see module docstring) ────
         extrap_score = _composition_extrapolation_score(comp)

@@ -120,7 +120,15 @@
   "n_lab_batches": 48,
   "n_synthetic": 200,
   "generation_method": "Physics-informed non-linear surrogate. Linear terms: Ridge regression on 48 lab batches, per-target alpha selected via nested LOO-CV (grid capped at 10.0), sign-only physics correction (no magnitude floor) (Hoerl & Kennard 1970; Reed 1995). Non-linear terms: Clay\u00d7Feldspar interaction + AG98 quadratic, fixed constants carried over from the previous calibration (Carty & Senapati 1998 DOI:10.1111/j.1151-2916.1998.tb02439.x) -- flagged as a limitation pending nested-CV validation of their marginal contribution on THIS dataset.",
-  "noise_model": "heteroscedastic \u2014 \u03c3(d) = \u03c3_base\u00b7(1 + d/d_ref); \u03c3_base = 4% of observed range",
+  "noise_model": "heteroscedastic \u2014 \u03c3(d) = \u03c3_base\u00b7(1 + d/d_ref); \u03c3_base = 4% of each target's observed laboratory range; d = mean bound-normalised distance to the 3 nearest calibration batches; d_ref = median pairwise bound-normalised distance between calibration batches.",
+  "noise_sigma_base_frac": 0.04,
+  "noise_sigma_base_per_target": {
+    "MOR_MPa": 1.0257755899999998,
+    "WA_pct": 0.039192,
+    "Shrinkage_pct": 0.06800000000000005
+  },
+  "noise_d_ref": 0.999430712667981,
+  "noise_distance_k_nearest": 3,
   "validation_method": "Nested Leave-One-Out cross-validation on 48 laboratory batches (Ridge coefficients AND alpha refit per outer fold using only the training fold); reports MAE/range and skill score relative to a mean-only baseline. A 25%-of-range PASS is not reported as evidence of a learned relationship unless skill score is also > 0.",
   "physics_coefficients": {
     "AG98": {
@@ -195,5 +203,5 @@
     "Shrinkage_pct": 11.025833333333333
   },
   "data_hash": "ff972810",
-  "generated_at": "2026-09-14 05:09 UTC"
+  "generated_at": "2026-09-17 09:06 UTC"
 }
